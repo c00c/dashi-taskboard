@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Taskboard Canvas Overlay — Build 1, Convergence Pass 1</title>
+    <title>Taskboard Canvas Overlay — Build 1, Round 2 Convergence</title>
     <style>
       :root {
         color-scheme: light;
@@ -193,29 +193,29 @@
     <div class="shell">
       <div class="utility">
         <span>c00c/dashi-taskboard &middot; issue #1 &middot; build 1</span>
-        <span>opId iss1/converging/r2-p1 &middot; round 2 &middot; pass 1</span>
+        <span>opId iss1/converging/r2-p2 &middot; round 2 &middot; passes 1&ndash;2</span>
       </div>
 
       <header class="masthead">
-        <p class="eyebrow">Implement &mdash; convergence pass 1</p>
-        <h1>Two independent reviews, nine findings, seven fixed</h1>
+        <p class="eyebrow">Implement &mdash; convergence passes 1 and 2</p>
+        <h1>Twelve findings over two passes, ten fixed</h1>
         <p class="lede">
-          The round&nbsp;1 branch was reviewed twice in parallel &mdash; once by the primary
-          reviewer and once by the mandated secondary model (GPT&#8209;5.3&#8209;Codex) &mdash;
-          then every finding was verified against the source before any code moved. Fixes were
-          built in three isolated worktrees split by conflict domain and integrated onto the one
-          canonical branch.
+          Each pass ran two independent reviews in parallel &mdash; the primary reviewer and the
+          mandated secondary model (GPT&#8209;5.3&#8209;Codex) &mdash; and every finding was
+          reproduced against the real source before any code moved. Pass&nbsp;2 earned its keep:
+          it caught three defects that were the <em>same</em> defects pass&nbsp;1 had fixed, left
+          applied to only two of their three sites.
         </p>
         <ul class="stats">
-          <li><span class="n">9</span><span class="k">findings triaged</span></li>
-          <li><span class="n">7</span><span class="k">fixed this pass</span></li>
+          <li><span class="n">12</span><span class="k">findings triaged</span></li>
+          <li><span class="n">10</span><span class="k">fixed</span></li>
           <li><span class="n">2</span><span class="k">deferred with cause</span></li>
           <li><span class="n">0</span><span class="k">new test failures</span></li>
         </ul>
       </header>
 
       <section>
-        <h2>Prioritised findings</h2>
+        <h2>Pass 1 &mdash; prioritised findings</h2>
         <p class="section-note">
           Ordered by priority. Every entry was reproduced against the real source before it was
           accepted &mdash; a reviewer claim on its own was not treated as a finding.
@@ -404,28 +404,144 @@
       </section>
 
       <section>
+        <h2>Pass 2 &mdash; the fixes that were only half-applied</h2>
+        <p class="section-note">
+          Both reviews ran again against the integrated pass&nbsp;1 branch. Three findings came
+          back, all verified against source, all fixed. Two of the three were pass&nbsp;1&rsquo;s
+          own corrections applied to <code>TaskDetail.tsx</code> and <code>TaskEditor.tsx</code>
+          but never to the third site, <code>TaskCard.tsx</code> &mdash; which is the case for
+          running a second pass rather than trusting the first.
+        </p>
+        <table>
+          <caption>Origin: P = primary review, S = secondary review (GPT&#8209;5.3&#8209;Codex).</caption>
+          <thead>
+            <tr>
+              <th scope="col">Priority</th>
+              <th scope="col">Finding</th>
+              <th scope="col">Origin</th>
+              <th scope="col">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>Board-card quick edits bypassed the provider write set.</strong>
+                <code>TaskCard</code> rendered priority, label and due-date controls with no
+                capability check at all, so an Azure&nbsp;DevOps card dispatched mutations the
+                server rejects with&nbsp;409. Its assignee gate was still the hard-coded
+                <code>source === "jira"</code> string. All four gates now derive from
+                <code>canMutateTaskField</code>.
+              </td>
+              <td>S</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>The assignee dedupe never ran on the external branch.</strong>
+                Member access binds tighter than <code>?:</code>, so
+                <code>.filter(dedupe)</code> applied only to the local branch of the ternary. An
+                unassigned ADO item made <code>task.assignee</code> byte-identical to
+                <code>UNASSIGNED_ACTOR</code>, producing a duplicated option and a duplicate React
+                key. Parenthesised, matching the two sibling files.
+              </td>
+              <td>P</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>The write set went stale across a source change.</strong>
+                <code>TaskDetail</code>&rsquo;s effect was keyed on <code>[task.source]</code> but
+                never cleared the previous provider&rsquo;s capabilities, so a task could be judged
+                against the prior provider until the fetch landed. Fixed by deletion: the effect
+                and its state are gone and the write set is derived at render time.
+              </td>
+              <td>S</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="callout">
+          The hard-coded <code>=== "jira"</code> assignee guard had been returning the right answer
+          <em>by coincidence</em>. Jira declares priority, labels and due date but not assignee;
+          Azure&nbsp;DevOps declares assignee but none of the other three. The two providers are
+          near-inverses, so a guard naming one of them happened to be correct for that one and
+          silently wrong for the other. Deriving from declared capabilities makes both correct by
+          construction &mdash; which is what ticket&nbsp;04&rsquo;s provider-neutral seam asked for.
+        </p>
+      </section>
+
+      <section>
+        <h2>How pass 2 sourced the capability list</h2>
+        <p class="section-note">
+          <code>TaskCard</code> renders once per card, so the obvious fix &mdash; fetch the provider
+          list inside the card &mdash; would have cost one HTTP request per card on the board.
+        </p>
+        <div class="lanes">
+          <div class="lane">
+            <h3>One fetch, existing path</h3>
+            <p>
+              The list is fetched once in <code>App</code> and drilled through
+              <code>BoardColumn</code> and <code>OtherTasksPanel</code> along the exact prop path
+              <code>availableLabels</code> already uses. No new cache, no new mechanism.
+            </p>
+            <p><code>web/src/App.tsx</code> &plus;15 lines</p>
+          </div>
+          <div class="lane">
+            <h3>Derived, not stored</h3>
+            <p>
+              Each card computes its own write set from its own <code>task.source</code> at render
+              time. A card can no longer be judged against another provider&rsquo;s rules, because
+              nothing is held in state to go stale.
+            </p>
+            <p><code>web/src/components/TaskDetail.tsx</code> &minus;15 lines</p>
+          </div>
+          <div class="lane">
+            <h3>Unknown stays editable</h3>
+            <p>
+              Before the fetch resolves &mdash; or if it fails &mdash; the list is empty, the write
+              set is <code>null</code>, and every field stays editable with the server&rsquo;s 409
+              as the backstop. A transient failure cannot lock the board.
+            </p>
+            <p><code>web/src/externalWriteSet.ts</code> unchanged</p>
+          </div>
+        </div>
+        <p class="callout">
+          Reported rather than hidden: the staleness in finding&nbsp;3 is real at the component
+          level but hard to reach in the running app, because <code>TaskDetail</code> is rendered
+          with <code>key={detailTask.id}</code> and remounts when the task changes. It was still
+          fixed &mdash; the fix is a net deletion, and it removes the trap if that key is ever
+          dropped.
+        </p>
+      </section>
+
+      <section>
         <h2>Validation on the integrated branch</h2>
         <p class="section-note">
-          Measured after all three lanes were merged, not per lane. The single remaining failure is
+          Re-run in full on the canonical branch after pass&nbsp;2 was integrated &mdash; not
+          inherited from the fix worker&rsquo;s worktree. The single remaining failure is
           documented and also fails on <code>main</code>.
         </p>
         <ul class="checks">
           <li><span><code>node --test</code> (CI shape, type stripping on)</span><span class="r">401 tests &middot; 398 pass &middot; 1 pre-existing fail</span></li>
-          <li><span><code>npm run test:components</code></span><span class="r">4 files &middot; 23 pass</span></li>
+          <li><span><code>npm run test:components</code></span><span class="r">5 files &middot; 29 pass</span></li>
           <li><span><code>npm run typecheck</code></span><span class="r">pass</span></li>
-          <li><span><code>npm run build:web</code></span><span class="r">pass</span></li>
+          <li><span><code>npm run build</code> (full, incl. injector)</span><span class="r">pass</span></li>
           <li><span><code>npm run copilot:verify-canvas</code></span><span class="r">42 / 42 pass</span></li>
         </ul>
         <p class="callout">
-          Before this pass the same CI-shape run reported <strong>two</strong> failures. One of them
-          was the vitest file being collected by the wrong runner &mdash; a break that only appears
-          on the Node version CI actually uses, which is why it survived round&nbsp;1.
+          Two gaps closed since pass&nbsp;1. The component suite reads a hard-coded file list, so a
+          new test file does not run until it is registered &mdash; the count moving 23&nbsp;&rarr;&nbsp;29
+          is the evidence the new cases execute. And the build gate now runs the full
+          <code>npm&nbsp;run&nbsp;build</code> that CI runs, not just <code>build:web</code>.
         </p>
       </section>
 
       <footer class="shell">
-        Convergence pass 1 of a maximum 10. Agreement not yet declared: this pass changed
-        behaviour in three areas, so remaining work has not reached diminishing returns.
+        Convergence pass 2 of a maximum 10. Every finding raised across both passes is either
+        fixed or deferred with a recorded cause; nothing was left half-applied.
       </footer>
     </div>
   </body>
