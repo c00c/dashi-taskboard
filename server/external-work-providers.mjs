@@ -14,6 +14,11 @@ const MUTATIONS = new Set([
   "dueDate",
   "assignee",
 ]);
+const LOCAL_ONLY_MUTATIONS = new Set([
+  "developmentContext",
+  "startDate",
+  "recurrence",
+]);
 
 export class ExternalWorkProviderError extends ApiError {
   constructor(status, code, message, details) {
@@ -184,10 +189,15 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
     if (supportedMutations.some((mutation) => !MUTATIONS.has(mutation))) {
       throw new Error(`External work provider '${id}' declares an unsupported mutation`);
     }
+    const localOnlyMutations = [...new Set(provider.localOnlyMutations ?? [])];
+    if (localOnlyMutations.some((mutation) => !LOCAL_ONLY_MUTATIONS.has(mutation))) {
+      throw new Error(`External work provider '${id}' declares an unsupported local-only mutation`);
+    }
     providerMap.set(id, {
       id,
       displayName: requireString(provider.displayName, "provider.displayName", 120),
       supportedMutations,
+      localOnlyMutations,
       supportsComments: provider.supportsComments === true,
       authoritativeMutations: provider.authoritativeMutations === true,
       managesSynchronization: provider.managesSynchronization === true,
@@ -197,6 +207,9 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
       synchronize: (...args) => provider.synchronize(...args),
       mapStatus: (...args) => provider.mapStatus(...args),
       mutateTask: (...args) => provider.mutateTask(...args),
+      discoverActors: typeof provider.discoverActors === "function"
+        ? (...args) => provider.discoverActors(...args)
+        : null,
       addComment: typeof provider.addComment === "function"
         ? (...args) => provider.addComment(...args)
         : null,
@@ -220,6 +233,8 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
       displayName: provider.displayName,
       connection: await provider.getConnection(),
       supportedMutations: provider.supportedMutations,
+      localOnlyMutations: provider.localOnlyMutations,
+      ...(provider.discoverActors ? { supportsActorDiscovery: true } : {}),
       ...(provider.supportsComments ? { supportsComments: true } : {}),
     };
   }
@@ -233,6 +248,29 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
     },
     supportsMutation(providerId, mutation) {
       return get(providerId).supportedMutations.includes(mutation);
+    },
+    planTaskMutation(providerId, changes) {
+      const provider = get(providerId);
+      const remoteChanges = {};
+      const localChanges = {};
+      const unsupported = [];
+      for (const [field, value] of Object.entries(changes)) {
+        if (provider.supportedMutations.includes(field)) remoteChanges[field] = value;
+        else if (provider.localOnlyMutations.includes(field)) localChanges[field] = value;
+        else unsupported.push(field);
+      }
+      if (unsupported.length > 0) {
+        throw new ExternalWorkProviderError(
+          409,
+          "EXTERNAL_MUTATION_UNSUPPORTED",
+          `Provider '${providerId}' does not support: ${unsupported.join(", ")}`,
+          {
+            supportedMutations: provider.supportedMutations,
+            localOnlyMutations: provider.localOnlyMutations,
+          },
+        );
+      }
+      return { remoteChanges, localChanges };
     },
     hasAuthoritativeMutations(providerId) {
       return get(providerId).authoritativeMutations;
@@ -254,6 +292,13 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
         normalizeProject(provider.id, project)
       ));
       return { provider: await describe(provider), projects };
+    },
+    async actors(providerId) {
+      const provider = get(providerId);
+      if (!provider.discoverActors) return { actors: [] };
+      return {
+        actors: (await provider.discoverActors()).map((actor) => normalizeActor(actor, providerId)),
+      };
     },
     async synchronize(providerId, options) {
       const provider = get(providerId);

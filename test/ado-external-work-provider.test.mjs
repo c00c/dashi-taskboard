@@ -31,6 +31,7 @@ function createAdoFixture() {
     failRefreshAfterMutation: false,
     commentFailure: false,
     paginateComments: false,
+    graphFailure: false,
     requests: [],
   };
 
@@ -40,6 +41,7 @@ function createAdoFixture() {
       const url = new URL(input);
       state.requests.push({
         method: init.method ?? "GET",
+        hostname: url.hostname,
         pathname: url.pathname,
         apiVersion: url.searchParams.get("api-version"),
         continuationToken: url.searchParams.get("continuationToken"),
@@ -47,6 +49,38 @@ function createAdoFixture() {
         contentType: init.headers?.["content-type"],
         body: init.body ? JSON.parse(init.body) : null,
       });
+
+      if (url.hostname === "vssps.dev.azure.com" && url.pathname === "/example-org/_apis/graph/users") {
+        if (state.graphFailure) {
+          return Response.json({ message: "graph unavailable" }, { status: 503 });
+        }
+        return Response.json({
+          count: 2,
+          value: [{
+            descriptor: "aad.next-user",
+            originId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            displayName: "Next ADO User",
+            principalName: "next@example.test",
+          }, {
+            descriptor: "aad.another-user",
+            originId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            displayName: "Another ADO User",
+            principalName: "another@example.test",
+          }],
+        });
+      }
+      if (
+        url.hostname === "vssps.dev.azure.com"
+        && url.pathname === "/example-org/_apis/graph/storagekeys/aad.next-user"
+      ) {
+        return Response.json({ value: "33333333-3333-3333-3333-333333333333" });
+      }
+      if (
+        url.hostname === "vssps.dev.azure.com"
+        && url.pathname === "/example-org/_apis/graph/storagekeys/aad.another-user"
+      ) {
+        return Response.json({ value: "44444444-4444-4444-4444-444444444444" });
+      }
 
       if (url.pathname === "/example-org/project-one/_apis/git/repositories") {
         return Response.json({
@@ -285,6 +319,25 @@ test("ADO discovery and synchronization are observable through the public provid
     assert.equal(provider.supportsComments, true);
     assert.equal(provider.connection.organization, "example-org");
 
+    const actors = await request(baseUrl, "/api/external-work/providers/ado/actors");
+    assert.equal(actors.response.status, 200);
+    assert.deepEqual(actors.body.actors, [{
+      type: "user",
+      id: "ado:33333333-3333-3333-3333-333333333333",
+      name: "Next ADO User",
+      avatarUrl: null,
+    }, {
+      type: "user",
+      id: "ado:44444444-4444-4444-4444-444444444444",
+      name: "Another ADO User",
+      avatarUrl: null,
+    }]);
+    ado.state.graphFailure = true;
+    const failedActors = await request(baseUrl, "/api/external-work/providers/ado/actors");
+    assert.equal(failedActors.response.status, 502);
+    assert.equal(failedActors.body.error.code, "ADO_REQUEST_FAILED");
+    ado.state.graphFailure = false;
+
     const discovery = await request(baseUrl, "/api/external-work/providers/ado/projects");
     assert.equal(discovery.response.status, 200);
     assert.deepEqual(discovery.body.projects, [{
@@ -326,12 +379,20 @@ test("ADO discovery and synchronization are observable through the public provid
     );
     assert.deepEqual(task.labels, ["ado", "integration"]);
 
-    const moved = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}/move`, {
-      method: "POST",
-      body: { version: task.version, status: "in_review" },
+    const moved = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
+      method: "PATCH",
+      body: {
+        version: task.version,
+        status: "in_review",
+        developmentContext: { type: "branch", branch: "ado-local-work" },
+      },
     });
     assert.equal(moved.response.status, 200);
     assert.equal(moved.body.task.status, "in_review");
+    assert.deepEqual(moved.body.task.developmentContext, {
+      type: "branch",
+      branch: "ado-local-work",
+    });
 
     const unassigned = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
       method: "PATCH",
@@ -342,13 +403,23 @@ test("ADO discovery and synchronization are observable through the public provid
 
     const assigned = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
       method: "PATCH",
-      headers: {
-        "x-taskboard-user-id": "33333333-3333-3333-3333-333333333333",
-        "x-taskboard-user-name": "Next%20ADO%20User",
-      },
       body: {
         version: unassigned.body.task.version,
-        assigneeTarget: "current-user",
+        title: unassigned.body.task.title,
+        description: unassigned.body.task.description,
+        status: unassigned.body.task.status,
+        priority: unassigned.body.task.priority,
+        labels: unassigned.body.task.labels,
+        assignee: {
+          type: "user",
+          id: "ado:33333333-3333-3333-3333-333333333333",
+          name: "Next ADO User",
+          avatarUrl: null,
+        },
+        developmentContext: unassigned.body.task.developmentContext,
+        startDate: unassigned.body.task.startDate,
+        dueDate: unassigned.body.task.dueDate,
+        recurrence: unassigned.body.task.recurrence,
       },
     });
     assert.equal(assigned.response.status, 200);
@@ -356,6 +427,17 @@ test("ADO discovery and synchronization are observable through the public provid
       assigned.body.task.assignee.id,
       "ado:33333333-3333-3333-3333-333333333333",
     );
+
+    const rejectedRemoteField = await request(
+      baseUrl,
+      `/api/tasks/${encodeURIComponent(task.id)}`,
+      {
+        method: "PATCH",
+        body: { version: assigned.body.task.version, title: "Must stay read-only" },
+      },
+    );
+    assert.equal(rejectedRemoteField.response.status, 409);
+    assert.equal(rejectedRemoteField.body.error.code, "EXTERNAL_MUTATION_UNSUPPORTED");
 
     const rejectedReorder = await request(
       baseUrl,
@@ -441,13 +523,24 @@ test("ADO discovery and synchronization are observable through the public provid
     assert.equal(updated.body.tasks[0].title, "Synchronize refreshed ADO work");
     assert.equal(updated.body.tasks[0].version, firstVersion + 1);
 
-    assert.equal(ado.state.requests.every((entry) => entry.apiVersion === "7.1"), true);
+    assert.equal(
+      ado.state.requests
+        .filter((entry) => entry.hostname !== "vssps.dev.azure.com")
+        .every((entry) => entry.apiVersion === "7.1"),
+      true,
+    );
     assert.equal(
       ado.state.requests.every(
         (entry) => entry.authorization === `Basic ${Buffer.from(":ado-secret").toString("base64")}`,
       ),
       true,
     );
+    const graph = ado.state.requests.find((entry) => entry.hostname === "vssps.dev.azure.com");
+    assert.equal(graph.apiVersion, "7.1-preview.1");
+    const storageKeyRequests = ado.state.requests.filter(
+      (entry) => entry.pathname.includes("/_apis/graph/storagekeys/"),
+    );
+    assert.deepEqual(storageKeyRequests.map((entry) => entry.apiVersion), ["7.1", "7.1"]);
     const batch = ado.state.requests.find(
       (entry) => entry.pathname.endsWith("/_apis/wit/workitemsbatch"),
     );
@@ -541,10 +634,14 @@ test("ADO write failures remain explicit and never create success-shaped local s
   refresh.state.failRefreshAfterMutation = true;
   const indeterminate = await request(
     refreshBaseUrl,
-    `/api/tasks/${encodeURIComponent(refreshTask.id)}/move`,
+    `/api/tasks/${encodeURIComponent(refreshTask.id)}`,
     {
-      method: "POST",
-      body: { version: refreshTask.version, status: "in_review" },
+      method: "PATCH",
+      body: {
+        version: refreshTask.version,
+        status: "in_review",
+        developmentContext: { type: "branch", branch: "must-not-persist" },
+      },
     },
   );
   assert.equal(indeterminate.response.status, 502);
@@ -554,6 +651,7 @@ test("ADO write failures remain explicit and never create success-shaped local s
     `/api/tasks/${encodeURIComponent(refreshTask.id)}`,
   );
   assert.equal(locallyUnchanged.body.task.status, "in_progress");
+  assert.equal(locallyUnchanged.body.task.developmentContext, null);
   assert.equal(refresh.state.remoteStatus, "Resolved");
 
   const comments = createAdoFixture();

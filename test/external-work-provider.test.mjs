@@ -32,6 +32,7 @@ function createControlledProvider() {
       id: "controlled",
       displayName: "Controlled provider",
       supportedMutations: ["title", "status"],
+      localOnlyMutations: ["developmentContext"],
       async getConnection() {
         return {
           configured: state.configured,
@@ -153,6 +154,7 @@ test("a controlled external provider is observable through the public server API
     displayName: "Controlled provider",
     connection: { configured: false, endpoint: null },
     supportedMutations: ["title", "status"],
+    localOnlyMutations: ["developmentContext"],
   });
 
   const connection = await request(
@@ -221,10 +223,18 @@ test("a controlled external provider is observable through the public server API
 
   const updated = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
     method: "PATCH",
-    body: { version: secondSync.body.tasks[0].version, title: "Updated remotely" },
+    body: {
+      version: secondSync.body.tasks[0].version,
+      title: "Updated remotely",
+      developmentContext: { type: "branch", branch: "provider-rework" },
+    },
   });
   assert.equal(updated.response.status, 200);
   assert.equal(updated.body.task.title, "Updated remotely");
+  assert.deepEqual(updated.body.task.developmentContext, {
+    type: "branch",
+    branch: "provider-rework",
+  });
   assert.deepEqual(controlled.state.mutations[0], {
     identity: {
       providerId: "controlled",

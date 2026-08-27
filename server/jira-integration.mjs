@@ -458,6 +458,7 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       "labels",
       "dueDate",
     ],
+    localOnlyMutations: ["developmentContext", "startDate", "recurrence"],
     managesSynchronization: true,
     getConnection: () => integration.status(),
     configure: (configuration) => integration.configure(configuration),

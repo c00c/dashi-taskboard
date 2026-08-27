@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { WebSocket as WebSocketClient, WebSocketServer } from "ws";
 
 import {
@@ -627,6 +627,34 @@ function resolveAssignee(target, actor) {
   return actor;
 }
 
+function parseActorIdentity(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["type", "id", "name", "avatarUrl"]));
+  if (value.type !== "user" && value.type !== "agent") {
+    throw new ApiError(400, "INVALID_FIELD", "'assignee.type' must be user or agent");
+  }
+  const avatarUrl = value.avatarUrl === null
+    ? null
+    : stringField(value.avatarUrl, "assignee.avatarUrl", { required: true, maxLength: 2048 });
+  if (avatarUrl !== null) {
+    let parsed;
+    try {
+      parsed = new URL(avatarUrl);
+    } catch {
+      throw new ApiError(400, "INVALID_FIELD", "'assignee.avatarUrl' must be a valid URL");
+    }
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      throw new ApiError(400, "INVALID_FIELD", "'assignee.avatarUrl' must use HTTP or HTTPS");
+    }
+  }
+  return {
+    type: value.type,
+    id: stringField(value.id, "assignee.id", { required: true, maxLength: 240 }),
+    name: stringField(value.name, "assignee.name", { required: true, maxLength: 120 }),
+    avatarUrl,
+  };
+}
+
 function parseTaskCreate(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
@@ -660,12 +688,15 @@ function parseTaskPatch(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "version", "projectId", "title", "description", "status", "priority", "labels", "threadId", "threadBinding",
-    "assigneeTarget", "developmentContext", "startDate", "dueDate", "recurrence",
+    "assignee", "assigneeTarget", "developmentContext", "startDate", "dueDate", "recurrence",
   ]));
   const version = parseVersion(body.version);
   const threadId = parseThreadId(body.threadId);
   const threadBinding = parseThreadBinding(body.threadBinding);
   const assigneeTarget = parseAssigneeTarget(body.assigneeTarget);
+  if (body.assignee !== undefined && assigneeTarget !== undefined) {
+    throw new ApiError(400, "INVALID_FIELD", "Use either 'assignee' or 'assigneeTarget', not both");
+  }
   const changes = {};
   if (body.projectId !== undefined) changes.projectId = validateProjectId(body.projectId);
   if (body.title !== undefined) changes.title = stringField(body.title, "title", { required: true, maxLength: 240 });
@@ -673,6 +704,7 @@ function parseTaskPatch(body) {
   if (body.status !== undefined) changes.status = parseStatus(body.status);
   if (body.priority !== undefined) changes.priority = parsePriority(body.priority);
   if (body.labels !== undefined) changes.labels = parseLabels(body.labels);
+  if (body.assignee !== undefined) changes.assignee = parseActorIdentity(body.assignee);
   if (body.developmentContext !== undefined) changes.developmentContext = parseDevelopmentContext(body.developmentContext);
   if (body.startDate !== undefined) changes.startDate = parseDueDate(body.startDate, "startDate");
   if (body.dueDate !== undefined) changes.dueDate = parseDueDate(body.dueDate);
@@ -2532,7 +2564,7 @@ export function createTaskboardServer(options = {}) {
       }
 
       const externalProviderRoute = pathname.match(
-        /^\/api\/external-work\/providers\/([^/]+)\/(connection|projects|sync)$/,
+        /^\/api\/external-work\/providers\/([^/]+)\/(connection|projects|actors|sync)$/,
       );
       if (externalProviderRoute) {
         const providerId = decodeRouteSegment(externalProviderRoute[1], "providerId");
@@ -2552,6 +2584,14 @@ export function createTaskboardServer(options = {}) {
         if (action === "projects") {
           if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
           return sendJson(response, 200, await externalWorkProviders.discover(providerId));
+        }
+        if (action === "actors") {
+          if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+          return sendJson(
+            response,
+            200,
+            await runExternalProviderOperation(providerId, () => externalWorkProviders.actors(providerId)),
+          );
         }
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         await assertEmptyRequestBody(request, `POST ${pathname}`);
@@ -3231,6 +3271,13 @@ export function createTaskboardServer(options = {}) {
               "Local tasks do not support an unassigned assignee",
             );
           }
+          if (Object.hasOwn(changes, "assignee") && current.source === "local") {
+            throw new ApiError(
+              400,
+              "INVALID_FIELD",
+              "Local tasks require an assignee target",
+            );
+          }
           const externalProviderId = current.source !== "local" ? current.source : null;
           if (externalProviderId) {
             return await runExternalProviderOperation(externalProviderId, async () => {
@@ -3279,23 +3326,43 @@ export function createTaskboardServer(options = {}) {
               if (assigneeTarget !== undefined) {
                 providerChanges.assignee = resolveAssignee(assigneeTarget, actor);
               }
-              const providerResult = await externalWorkProviders.mutateTask(
-                externalProviderId,
-                latest,
-                providerChanges,
+              const effectiveProviderChanges = Object.fromEntries(
+                Object.entries(providerChanges).filter(([field, value]) => (
+                  !isDeepStrictEqual(latest[field], value)
+                )),
               );
+              const { remoteChanges, localChanges } = externalWorkProviders.planTaskMutation(
+                externalProviderId,
+                effectiveProviderChanges,
+              );
+              const providerResult = Object.keys(remoteChanges).length > 0
+                ? await externalWorkProviders.mutateTask(
+                  externalProviderId,
+                  latest,
+                  remoteChanges,
+                )
+                : { authoritative: false, changed: false };
               if (providerResult.authoritative) {
-                const task = providerResult.task;
+                const task = Object.keys(localChanges).length > 0
+                  ? database.updateTask(
+                    id,
+                    providerResult.task.version,
+                    localChanges,
+                    threadId,
+                    threadBinding,
+                    actor,
+                  )
+                  : providerResult.task;
                 events.emit("task.updated", { task });
                 return sendJson(response, 200, { task });
               }
-              if (assigneeTarget !== undefined) changes.assignee = providerChanges.assignee;
+              const persistedChanges = { ...remoteChanges, ...localChanges };
               let task;
               try {
                 task = database.updateTask(
                   id,
                   version,
-                  changes,
+                  persistedChanges,
                   threadId,
                   threadBinding,
                   actor,

@@ -364,6 +364,7 @@ const EVENT_NAMES = [
   "project.created",
   "project.labels.updated",
   "project.readme.updated",
+  "external-work.synced",
 ] as const;
 
 function isTheme(value: unknown): value is Theme {
@@ -622,6 +623,10 @@ function LocalRealtimeSync({
         return;
       }
       if (event.type === "project.labels.updated") {
+        scheduleRefresh({ projects: true, tasks: affectsSelectedProject });
+        return;
+      }
+      if (event.type === "external-work.synced") {
         scheduleRefresh({ projects: true, tasks: affectsSelectedProject });
         return;
       }

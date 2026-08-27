@@ -15,6 +15,7 @@ import {
   getTask,
   listAttachments,
   listComments,
+  listExternalWorkActors,
   listTaskActivities,
   resolveTaskboardUrl,
   uploadAttachment,
@@ -415,6 +416,7 @@ export function TaskDetail({
     "status" | "priority" | "assignee" | "labels" | "development" | "recurrence" | null
   >(null);
   const [savingProperty, setSavingProperty] = useState<string | null>(null);
+  const [externalAssignees, setExternalAssignees] = useState<ActorIdentity[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachmentsError, setAttachmentsError] = useState<TaskDetailError | null>(null);
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
@@ -472,6 +474,21 @@ export function TaskDetail({
   useEffect(() => {
     resizeTextarea(titleRef.current);
   }, [title]);
+
+  useEffect(() => {
+    if (task.source === "local") {
+      setExternalAssignees([]);
+      return;
+    }
+    const controller = new AbortController();
+    void listExternalWorkActors(task.source, controller.signal).then(
+      setExternalAssignees,
+      (error) => {
+        if ((error as Error).name !== "AbortError") onError(messageFor(error));
+      },
+    );
+    return () => controller.abort();
+  }, [task.id, task.source]);
 
   useEffect(() => {
     if (!editingDescription) return;
@@ -1001,8 +1018,12 @@ export function TaskDetail({
   ) {
     developmentOptions.unshift(currentTask.developmentContext);
   }
-  const assigneeOptions = currentTask.source !== "local" && currentTask.source !== "jira"
-    ? [currentTask.assignee, UNASSIGNED_ACTOR]
+  const assigneeOptions = currentTask.source !== "local"
+    ? [
+      currentTask.assignee,
+      ...externalAssignees,
+      ...(externalAssignees.length > 0 ? [UNASSIGNED_ACTOR] : []),
+    ]
     : [currentTask.assignee, currentUser, CODEX_AGENT_ACTOR]
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
@@ -1751,7 +1772,11 @@ export function TaskDetail({
                   const assigneeTarget = selected
                     ? assigneeTargetForActor(selected, currentUser)
                     : undefined;
-                  if (assigneeTarget) void saveTask({ assigneeTarget }, "assignee");
+                  if (assigneeTarget) {
+                    void saveTask({ assigneeTarget }, "assignee");
+                  } else if (selected && currentTask.source !== "local") {
+                    void saveTask({ assignee: selected }, "assignee");
+                  }
                 }}
               />
             </div>

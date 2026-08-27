@@ -103,14 +103,18 @@ export function createAdoIntegration({
   let activeStateMapping = {};
 
   async function request(config, projectId, apiPath, init = {}) {
-    const url = new URL(adoUrl(config, projectId, apiPath));
-    url.searchParams.set("api-version", API_VERSION);
     const {
+      baseUrl,
+      apiVersion = API_VERSION,
       retryable = (init.method ?? "GET") === "GET",
       indeterminateCode,
       returnResponseMetadata = false,
       ...fetchInit
     } = init;
+    const url = new URL(baseUrl
+      ? `${baseUrl.replace(/\/$/, "")}${apiPath}`
+      : adoUrl(config, projectId, apiPath));
+    url.searchParams.set("api-version", apiVersion);
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -434,6 +438,7 @@ export function createAdoIntegration({
     id: "ado",
     displayName: "Azure DevOps",
     supportedMutations: ["status", "assignee"],
+    localOnlyMutations: ["developmentContext"],
     supportsComments: true,
     authoritativeMutations: true,
     async getConnection() {
@@ -470,6 +475,58 @@ export function createAdoIntegration({
       const repositories = await listRepositories(config);
       await validateRepositoryMappings(config, repositories);
       return repositories.map((repository) => mappedProject(config, repository));
+    },
+    async discoverActors() {
+      const config = await configStore.read();
+      if (!config) {
+        throw new ExternalWorkProviderError(
+          409,
+          "ADO_NOT_CONFIGURED",
+          "Azure DevOps is not configured",
+        );
+      }
+      const actors = [];
+      let continuationToken = null;
+      do {
+        const query = new URLSearchParams();
+        if (continuationToken) query.set("continuationToken", continuationToken);
+        const page = await request(
+          config,
+          null,
+          `/_apis/graph/users?${query}`,
+          {
+            baseUrl: `https://vssps.dev.azure.com/${encodeURIComponent(config.organization)}/`,
+            apiVersion: "7.1-preview.1",
+            returnResponseMetadata: true,
+          },
+        );
+        for (const user of responseValues(page.payload, "user")) {
+          if (typeof user?.descriptor !== "string" || !user.descriptor || !user?.displayName) continue;
+          const storageKey = await request(
+            config,
+            null,
+            `/_apis/graph/storagekeys/${encodeURIComponent(user.descriptor)}`,
+            {
+              baseUrl: `https://vssps.dev.azure.com/${encodeURIComponent(config.organization)}/`,
+            },
+          );
+          if (!ADO_IDENTITY_ID_PATTERN.test(storageKey?.value ?? "")) {
+            throw new ExternalWorkProviderError(
+              502,
+              "INVALID_ADO_RESPONSE",
+              "Azure DevOps returned an invalid user storage key",
+            );
+          }
+          actors.push(actorFromIdentity({
+            id: storageKey.value,
+            displayName: user.displayName,
+          }, storageKey.value));
+        }
+        continuationToken = page.headers.get("x-ms-continuationtoken");
+      } while (continuationToken);
+      return actors.filter((actor, index) => (
+        actors.findIndex((candidate) => candidate.id === actor.id) === index
+      ));
     },
     async synchronize() {
       return synchronizeSnapshot();

@@ -425,7 +425,7 @@ export interface Task {
   startDate: string | null;
   dueDate: string | null;
   recurrence: Recurrence | null;
-  source: "local" | "jira";
+  source: string;
   externalOrigin?: string | null;
   externalKey?: string | null;
   externalUrl: string | null;
@@ -521,6 +521,7 @@ export interface TaskDraft {
   status: TaskStatus;
   priority: TaskPriority;
   labels: string[];
+  assignee?: ActorIdentity;
   assigneeTarget?: AssigneeTarget;
   developmentContext: DevelopmentContext | null;
   startDate: string | null;

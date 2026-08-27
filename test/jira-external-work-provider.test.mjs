@@ -211,20 +211,28 @@ test("Jira preserves its public API behavior through the external-work provider"
   assert.equal(rejectedProject.response.status, 409);
   assert.equal(rejectedProject.body.error.code, "JIRA_PROJECT_MOVE_UNAVAILABLE");
 
-  const rejectedRecurrence = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
+  const localFieldsUpdated = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
     method: "PATCH",
     body: {
       version: fieldsUpdated.body.task.version,
+      developmentContext: { type: "branch", branch: "jira-local-work" },
+      startDate: "2026-09-10",
       recurrence: { interval: 1, unit: "week" },
     },
   });
-  assert.equal(rejectedRecurrence.response.status, 409);
-  assert.equal(rejectedRecurrence.body.error.code, "EXTERNAL_MUTATION_UNSUPPORTED");
+  assert.equal(localFieldsUpdated.response.status, 200);
+  assert.deepEqual(localFieldsUpdated.body.task.developmentContext, {
+    type: "branch",
+    branch: "jira-local-work",
+  });
+  assert.equal(localFieldsUpdated.body.task.startDate, "2026-09-10");
+  assert.deepEqual(localFieldsUpdated.body.task.recurrence, { interval: 1, unit: "week" });
+  assert.equal(jira.state.issueUpdates.length, 2);
 
   const rejectedArchive = await request(
     baseUrl,
     `/api/tasks/${encodeURIComponent(task.id)}/archive`,
-    { method: "POST", body: { version: fieldsUpdated.body.task.version } },
+    { method: "POST", body: { version: localFieldsUpdated.body.task.version } },
   );
   assert.equal(rejectedArchive.response.status, 409);
   assert.equal(rejectedArchive.body.error.code, "JIRA_ARCHIVE_UNAVAILABLE");

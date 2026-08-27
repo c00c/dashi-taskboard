@@ -621,6 +621,17 @@ export async function updateTask(task: Task, draft: Partial<TaskDraft>, threadId
   return data.task;
 }
 
+export async function listExternalWorkActors(
+  providerId: string,
+  signal?: AbortSignal,
+): Promise<ActorIdentity[]> {
+  const data = await request<{ actors: ActorIdentity[] }>(
+    `/api/external-work/providers/${encodeURIComponent(providerId)}/actors`,
+    { signal },
+  );
+  return data.actors;
+}
+
 export async function moveTask(
   task: Task,
   status: TaskStatus,
