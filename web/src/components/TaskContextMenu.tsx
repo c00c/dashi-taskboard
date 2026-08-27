@@ -382,7 +382,7 @@ export function TaskContextMenu({
           onPointerEnter={closeSubmenu}
           onClick={() => closeThen(() => onEdit(task))}
         />
-        {task.source !== "jira" && (
+        {task.source === "local" && (
           <MenuItem
             label={text("创建副本", "Create copy")}
             icon={<LinearIcon name="copy" />}

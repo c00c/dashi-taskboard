@@ -67,6 +67,15 @@ function normalizeProject(providerId, project) {
     : {
       id: requireString(project.repository.id, "project.repository.id", 256),
       name: requireString(project.repository.name, "project.repository.name", 256),
+      ...(project.repository.configuredProjectId == null
+        ? {}
+        : {
+            configuredProjectId: requireString(
+              project.repository.configuredProjectId,
+              "project.repository.configuredProjectId",
+              256,
+            ),
+          }),
       projectId: requireString(project.repository.projectId, "project.repository.projectId", 256),
       projectName: requireString(
         project.repository.projectName,
@@ -314,9 +323,9 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
       await provider.configure(configuration);
       return describe(provider);
     },
-    async discover(providerId) {
+    async discover(providerId, configuration) {
       const provider = get(providerId);
-      const projects = (await provider.discoverProjects()).map((project) => (
+      const projects = (await provider.discoverProjects(configuration)).map((project) => (
         normalizeProject(provider.id, project)
       ));
       return { provider: await describe(provider), projects };

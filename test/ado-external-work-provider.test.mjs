@@ -318,8 +318,36 @@ test("ADO discovery and synchronization are observable through the public provid
         Closed: "done",
       },
     });
+
     assert.equal(JSON.stringify(configured.body).includes("ado-secret"), false);
     assert.equal((await readFile(configPath, "utf8")).includes("ado-secret"), true);
+
+    const keptCredential = await request(
+      baseUrl,
+      "/api/external-work/providers/ado/connection",
+      {
+        method: "PUT",
+        body: configuration(directory, { personalAccessToken: "" }),
+      },
+    );
+    assert.equal(keptCredential.response.status, 200);
+    assert.equal(JSON.stringify(keptCredential.body).includes("ado-secret"), false);
+
+    const rediscoveredWithSavedCredential = await request(
+      baseUrl,
+      "/api/external-work/providers/ado/projects",
+      {
+        method: "POST",
+        body: {
+          organization: "example-org",
+          personalAccessToken: "",
+          projects: [{ id: "project-one", name: "Project One" }],
+        },
+      },
+    );
+    assert.equal(rediscoveredWithSavedCredential.response.status, 200);
+    assert.equal(rediscoveredWithSavedCredential.body.projects[0].repository.name, "taskboard");
+    assert.equal(JSON.stringify(rediscoveredWithSavedCredential.body).includes("ado-secret"), false);
 
     const providers = await request(baseUrl, "/api/external-work/providers");
     const provider = providers.body.providers.find((candidate) => candidate.id === "ado");
@@ -360,6 +388,7 @@ test("ADO discovery and synchronization are observable through the public provid
       repository: {
         id: "11111111-1111-1111-1111-111111111111",
         name: "taskboard",
+        configuredProjectId: "project-one",
         projectId: "22222222-2222-2222-2222-222222222222",
         projectName: "Project One",
       },
@@ -655,6 +684,35 @@ test("ADO synchronization recovers an accepted comment after local persistence f
     ["Accepted remotely once"],
   );
   assert.equal(ado.state.comments.length, 1);
+});
+
+test("ADO repositories can be discovered from draft credentials without saving or returning the token", async () => {
+  const ado = createAdoFixture();
+  const { baseUrl, configPath } = await startServer(ado.fetch);
+
+  const discovery = await request(
+    baseUrl,
+    "/api/external-work/providers/ado/projects",
+    {
+      method: "POST",
+      body: {
+        organization: "example-org",
+        personalAccessToken: "draft-secret",
+        projects: [{ id: "project-one", name: "Project One" }],
+      },
+    },
+  );
+
+  assert.equal(discovery.response.status, 200);
+  assert.equal(discovery.body.projects[0].repository.name, "taskboard");
+  assert.equal(JSON.stringify(discovery.body).includes("draft-secret"), false);
+  await assert.rejects(readFile(configPath, "utf8"), { code: "ENOENT" });
+
+  const providers = await request(baseUrl, "/api/external-work/providers");
+  assert.equal(
+    providers.body.providers.find((candidate) => candidate.id === "ado").connection.configured,
+    false,
+  );
 });
 
 test("ADO rejects unmapped states without partially persisting a snapshot", async () => {

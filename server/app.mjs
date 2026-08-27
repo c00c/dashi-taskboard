@@ -2584,8 +2584,22 @@ export function createTaskboardServer(options = {}) {
           });
         }
         if (action === "projects") {
-          if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
-          return sendJson(response, 200, await externalWorkProviders.discover(providerId));
+          if (request.method === "GET") {
+            return sendJson(response, 200, await externalWorkProviders.discover(providerId));
+          }
+          if (request.method === "POST") {
+            const configuration = await readJson(request);
+            assertPlainObject(configuration);
+            return sendJson(
+              response,
+              200,
+              await runExternalProviderOperation(
+                providerId,
+                () => externalWorkProviders.discover(providerId, configuration),
+              ),
+            );
+          }
+          return methodNotAllowed(response, ["GET", "POST"]);
         }
         if (action === "actors") {
           if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);

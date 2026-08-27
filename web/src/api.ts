@@ -6,6 +6,10 @@ import type {
   AiChatSandbox,
   AiChatThread,
   AiChatThreadSnapshot,
+  AdoConnection,
+  AdoConfigurationInput,
+  AdoDiscoveryInput,
+  AdoDiscoveredProject,
   Attachment,
   Comment,
   ComposerCandidatesQuery,
@@ -224,6 +228,76 @@ export async function syncJiraConnection(): Promise<JiraConnection> {
     method: "POST",
   });
   return data.connection;
+}
+
+export interface ExternalWorkProviderDescription {
+  id: string;
+  displayName: string;
+  connection: unknown;
+  supportedMutations: string[];
+  localOnlyMutations: string[];
+}
+
+function isAdoConnection(value: unknown): value is AdoConnection {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const connection = value as Record<string, unknown>;
+  return (
+    typeof connection.configured === "boolean"
+    && (connection.organization === null || typeof connection.organization === "string")
+    && Array.isArray(connection.projects)
+    && Boolean(connection.stateMapping)
+    && typeof connection.stateMapping === "object"
+    && !Array.isArray(connection.stateMapping)
+  );
+}
+
+export async function getAdoConnection(signal?: AbortSignal): Promise<AdoConnection> {
+  const data = await request<{ providers: ExternalWorkProviderDescription[] }>(
+    "/api/external-work/providers",
+    { signal },
+  );
+  const provider = data.providers.find((candidate) => candidate.id === "ado");
+  if (!provider || !isAdoConnection(provider.connection)) {
+    return { configured: false, organization: null, projects: [], stateMapping: {} };
+  }
+  return provider.connection;
+}
+
+export async function discoverAdoRepositories(
+  input: AdoDiscoveryInput,
+): Promise<AdoDiscoveredProject[]> {
+  const data = await request<{ projects: AdoDiscoveredProject[] }>(
+    "/api/external-work/providers/ado/projects",
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return data.projects;
+}
+
+export async function configureAdoConnection(
+  input: AdoConfigurationInput,
+): Promise<AdoConnection> {
+  const data = await request<{ provider: { connection: AdoConnection } }>(
+    "/api/external-work/providers/ado/connection",
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+  return data.provider.connection;
+}
+
+export async function syncAdoConnection(): Promise<{
+  connection: AdoConnection;
+  projectIds: string[];
+  taskCount: number;
+}> {
+  const data = await request<{
+    provider: { connection: AdoConnection };
+    projects: Project[];
+    tasks: Task[];
+  }>("/api/external-work/providers/ado/sync", { method: "POST" });
+  return {
+    connection: data.provider.connection,
+    projectIds: data.projects.map((project) => project.id),
+    taskCount: data.tasks.length,
+  };
 }
 
 export async function getProjectSummary(

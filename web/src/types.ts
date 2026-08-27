@@ -333,7 +333,7 @@ export interface Project {
   id: string;
   name: string;
   workspacePath: string | null;
-  source: "local" | "jira";
+  source: "local" | "jira" | "ado";
   labels: string[];
   issueCount: number;
   createdAt: string;
@@ -445,6 +445,54 @@ export interface JiraConnection {
   projectId: string;
   lastSyncedAt: string | null;
   insecureHttp: boolean;
+}
+
+export interface AdoRepositoryMapping {
+  id: string;
+  workspacePath: string;
+  workItemIds: number[];
+}
+
+export interface AdoProjectConfiguration {
+  id: string;
+  name: string;
+  repositories: AdoRepositoryMapping[];
+}
+
+export interface AdoDiscoveryInput {
+  organization: string;
+  personalAccessToken: string;
+  projects: Array<{ id: string; name: string }>;
+}
+
+export interface AdoConfigurationInput extends AdoDiscoveryInput {
+  projects: AdoProjectConfiguration[];
+  stateMapping: Record<string, TaskStatus>;
+}
+
+export interface AdoConnection {
+  configured: boolean;
+  organization: string | null;
+  projects: AdoProjectConfiguration[];
+  stateMapping: Record<string, TaskStatus>;
+}
+
+export interface AdoDiscoveredProject {
+  id: string;
+  name: string;
+  labels: string[];
+  workspacePath: string | null;
+  repository: {
+    id: string;
+    name: string;
+    configuredProjectId: string;
+    projectId: string;
+    projectName: string;
+  };
+  externalOrigin: string;
+  externalId: string;
+  externalUrl: string;
+  source: "ado";
 }
 
 export interface Comment {

@@ -16,6 +16,7 @@ import {
   ApiError,
   addTaskRelation,
   archiveTask as archiveTaskRequest,
+  configureAdoConnection,
   createProjectLabel as createProjectLabelRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
@@ -24,9 +25,11 @@ import {
   deleteArchivedTask as deleteArchivedTaskRequest,
   deleteProjectLabel as deleteProjectLabelRequest,
   deleteProject as deleteProjectRequest,
+  discoverAdoRepositories,
   getAiChatCatalog,
   getCodexThreadProgress,
   getHostRuntime,
+  getAdoConnection,
   getJiraConnection,
   getTaskboardRevision,
   getTaskboardMetadata,
@@ -45,6 +48,7 @@ import {
   restoreTask as restoreTaskRequest,
   setApiText,
   setCurrentUserActor,
+  syncAdoConnection,
   syncJiraConnection,
   uploadAttachment,
   updateTask as updateTaskRequest,
@@ -62,6 +66,7 @@ import {
   type BoardDisplaySettings,
 } from "./components/BoardCardDisplayMenu";
 import { DashboardView } from "./components/DashboardView";
+import { AdoConnectionDialog } from "./components/AdoConnectionDialog";
 import { ProjectReadmeView } from "./components/ProjectReadmeView";
 import { IssueListView } from "./components/IssueListView";
 import { JiraConnectionDialog } from "./components/JiraConnectionDialog";
@@ -121,6 +126,10 @@ import {
 } from "./taskFilters";
 import {
   TASK_STATUSES,
+  type AdoConfigurationInput,
+  type AdoConnection,
+  type AdoDiscoveredProject,
+  type AdoDiscoveryInput,
   type ActorIdentity,
   type AiChatModel,
   type AiChatThread,
@@ -784,6 +793,17 @@ export function App() {
   const [jiraSaving, setJiraSaving] = useState(false);
   const [jiraSyncing, setJiraSyncing] = useState(false);
   const [jiraError, setJiraError] = useState<string | null>(null);
+  const [adoDialogOpen, setAdoDialogOpen] = useState(false);
+  const [adoConnection, setAdoConnection] = useState<AdoConnection>({
+    configured: false,
+    organization: null,
+    projects: [],
+    stateMapping: {},
+  });
+  const [adoRepositories, setAdoRepositories] = useState<AdoDiscoveredProject[]>([]);
+  const [adoBusy, setAdoBusy] = useState(false);
+  const [adoError, setAdoError] = useState<string | null>(null);
+  const [adoStatus, setAdoStatus] = useState<string | null>(null);
   const [pendingProjectDelete, setPendingProjectDelete] = useState<ProjectChoice | null>(null);
   const [projectDeleteIssueCount, setProjectDeleteIssueCount] = useState<number | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
@@ -875,6 +895,8 @@ export function App() {
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
   const isAllProjects = selectedProjectId === ALL_PROJECTS_ID;
   const isJiraProject = selectedProject?.source === "jira";
+  const isAdoProject = selectedProject?.source === "ado";
+  const isExternalProject = Boolean(selectedProject && selectedProject.source !== "local");
   const boardDisplaySettings = projectBoardDisplaySettings[selectedProjectId]
     ?? DEFAULT_BOARD_DISPLAY_SETTINGS;
   const automationModels = automationCatalog && automationCatalog.projectId === selectedProject?.id
@@ -909,7 +931,7 @@ export function App() {
     && tasks.length === 0
     && selectedProject
     && selectedProject.id !== GLOBAL_PROJECT_ID
-    && !isJiraProject
+    && !isExternalProject
     && localAiChatAvailable
       ? selectedProject.id
       : null;
@@ -1145,7 +1167,7 @@ export function App() {
   const developmentEditorProjectId = isAllProjects && editor ? editorProjectId : null;
   const createTargetProjects = projectChoices.flatMap((choice) => {
     const project = projects.find((candidate) => candidate.id === choice.id);
-    return project && project.source !== "jira"
+    return project && project.source === "local"
       ? [{ id: choice.id, name: choice.name }]
       : [];
   });
@@ -1823,8 +1845,9 @@ export function App() {
         listDeviceWorkspaces(signal),
       ]);
       if (requestId !== projectsRequestRef.current) return;
-      const [nextJiraConnection, nextTemporaryTasks] = await Promise.all([
+      const [nextJiraConnection, nextAdoConnection, nextTemporaryTasks] = await Promise.all([
         getJiraConnection(signal),
+        getAdoConnection(signal),
         listTasks(GLOBAL_PROJECT_ID, signal),
       ]);
       if (requestId !== projectsRequestRef.current) return;
@@ -1855,6 +1878,7 @@ export function App() {
           }
         : project));
       setJiraConnection(nextJiraConnection);
+      setAdoConnection(nextAdoConnection);
       setSelectedProjectId((current) => {
         const fromQuery = new URLSearchParams(window.location.search).get("project");
         if (fromQuery === ALL_PROJECTS_ID) return fromQuery;
@@ -2164,7 +2188,7 @@ export function App() {
         && !event.metaKey
         && !event.ctrlKey
         && selectedProjectId
-        && !isJiraProject
+        && !isExternalProject
       ) {
         event.preventDefault();
         setEditor({ task: null, status: "todo" });
@@ -2185,7 +2209,7 @@ export function App() {
 
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [boardView, contextMenu, detailTaskId, editor, isJiraProject, projectMenuOpen, selectedProjectId]);
+  }, [boardView, contextMenu, detailTaskId, editor, isExternalProject, projectMenuOpen, selectedProjectId]);
 
   const filteredTasks = useMemo(() => {
     return tasks.filter(
@@ -3226,6 +3250,96 @@ export function App() {
     }
   }
 
+  async function discoverAdo(input: AdoDiscoveryInput) {
+    if (adoBusy) return;
+    setAdoBusy(true);
+    setAdoError(null);
+    setAdoStatus(null);
+    try {
+      const repositories = await discoverAdoRepositories(input);
+      setAdoRepositories(repositories);
+      setAdoStatus(text(
+        `发现 ${repositories.length} 个存储库`,
+        `Discovered ${repositories.length} ${repositories.length === 1 ? "repository" : "repositories"}`,
+      ));
+    } catch (error) {
+      setAdoError(errorMessage(error));
+    } finally {
+      setAdoBusy(false);
+    }
+  }
+
+  async function openAdoDialog() {
+    setProjectMenuOpen(false);
+    setProjectContextMenu(null);
+    setAdoError(null);
+    setAdoStatus(null);
+    setAdoDialogOpen(true);
+    if (!adoConnection.configured || !adoConnection.organization) return;
+    await discoverAdo({
+      organization: adoConnection.organization,
+      personalAccessToken: "",
+      projects: adoConnection.projects.map(({ id, name }) => ({ id, name })),
+    });
+  }
+
+  async function syncAdoNow() {
+    if (adoBusy) return;
+    setAdoBusy(true);
+    setAdoError(null);
+    setAdoStatus(null);
+    setActionError(null);
+    try {
+      const result = await syncAdoConnection();
+      setAdoConnection(result.connection);
+      await Promise.all([
+        refreshProjectList(),
+        refreshTasks(taskScopeProjectId, { quiet: true }),
+      ]);
+      const message = text(
+        `已同步 ${result.taskCount} 个 Azure DevOps 工作项`,
+        `Synced ${result.taskCount} Azure DevOps work ${result.taskCount === 1 ? "item" : "items"}`,
+      );
+      setAdoStatus(message);
+      setAnnouncement(message);
+    } catch (error) {
+      const message = errorMessage(error);
+      setAdoError(message);
+      setActionError(message);
+    } finally {
+      setAdoBusy(false);
+    }
+  }
+
+  async function saveAdoConnection(input: AdoConfigurationInput) {
+    if (adoBusy) return;
+    setAdoBusy(true);
+    setAdoError(null);
+    setAdoStatus(null);
+    try {
+      const connection = await configureAdoConnection(input);
+      setAdoConnection(connection);
+      const result = await syncAdoConnection();
+      setAdoConnection(result.connection);
+      const nextProjects = await listProjects();
+      setProjects(nextProjects);
+      if (result.projectIds[0]) {
+        changeProject(result.projectIds[0]);
+        await refreshTasks(result.projectIds[0], { quiet: true });
+      }
+      const message = text(
+        `设置已保存，已同步 ${result.taskCount} 个工作项`,
+        `Settings saved; synced ${result.taskCount} work ${result.taskCount === 1 ? "item" : "items"}`,
+      );
+      setAdoStatus(message);
+      setAnnouncement(message);
+    } catch (error) {
+      setAdoError(errorMessage(error));
+    } finally {
+      setAdoBusy(false);
+    }
+  }
+
   function openCreateProjectDialog() {
     setProjectMenuOpen(false);
     setProjectContextMenu(null);
@@ -3480,6 +3594,19 @@ export function App() {
                         type="button"
                         role="menuitem"
                         disabled={openingProjectId !== null}
+                        onClick={() => void openAdoDialog()}
+                      >
+                        <RelationIcon className="project-avatar" color="currentColor" size={16} />
+                        <span>
+                          {adoConnection.configured
+                            ? text("Azure DevOps 设置", "Azure DevOps settings")
+                            : text("连接 Azure DevOps", "Connect Azure DevOps")}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        disabled={openingProjectId !== null}
                         onClick={openCreateProjectDialog}
                       >
                         <PlusIcon className="project-avatar" color="currentColor" size={16} />
@@ -3518,7 +3645,19 @@ export function App() {
                 <RefreshIcon color="currentColor" />
               </button>
             )}
-            {selectedProjectId && !isJiraProject && (
+            {isAdoProject && (
+              <button
+                className="icon-button"
+                type="button"
+                disabled={adoBusy}
+                onClick={() => void syncAdoNow()}
+                aria-label={text("同步 Azure DevOps", "Sync Azure DevOps")}
+                title={text("同步 Azure DevOps", "Sync Azure DevOps")}
+              >
+                <RefreshIcon color="currentColor" />
+              </button>
+            )}
+            {selectedProjectId && !isExternalProject && (
               <button
                 className="icon-button header-create-button"
                 type="button"
@@ -3852,7 +3991,7 @@ export function App() {
                         currentUser={currentUser}
                         showCover={boardDisplaySettings.cover}
                         showBody={boardDisplaySettings.body}
-                        createEnabled={!isJiraProject}
+                        createEnabled={!isExternalProject}
                         onCreateLabel={persistProjectLabel}
                         onCreate={(initialStatus) => setEditor({ task: null, status: initialStatus })}
                         onEdit={openTaskDetail}
@@ -3893,7 +4032,7 @@ export function App() {
                     restoringTaskId={restoringTaskId}
                     deletingTaskId={deletingArchivedTaskId}
                     onTabChange={setOtherTasksTab}
-                    onCreate={isJiraProject
+                    onCreate={isExternalProject
                       ? undefined
                       : (initialStatus) => setEditor({ task: null, status: initialStatus })}
                     onRestore={(task) => void restoreArchivedTask(task)}
@@ -3946,6 +4085,22 @@ export function App() {
             if (!jiraSaving) setJiraDialogOpen(false);
           }}
           onSave={saveJiraConnection}
+        />
+      )}
+
+      {adoDialogOpen && (
+        <AdoConnectionDialog
+          connection={adoConnection}
+          repositories={adoRepositories}
+          busy={adoBusy}
+          error={adoError}
+          status={adoStatus}
+          onClose={() => {
+            if (!adoBusy) setAdoDialogOpen(false);
+          }}
+          onDiscover={discoverAdo}
+          onSave={saveAdoConnection}
+          onSync={syncAdoNow}
         />
       )}
 

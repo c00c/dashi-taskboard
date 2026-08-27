@@ -143,6 +143,33 @@ function validateProjects(value) {
   return projects;
 }
 
+function validateDiscoveryProjects(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 50) {
+    throw new AdoConfigError(
+      "INVALID_ADO_PROJECTS",
+      "Azure DevOps projects must contain between 1 and 50 entries",
+    );
+  }
+  const projects = value.map((project) => {
+    if (!project || typeof project !== "object" || Array.isArray(project)) {
+      throw new AdoConfigError("INVALID_ADO_PROJECTS", "Each Azure DevOps project must be an object");
+    }
+    const allowedKeys = new Set(["id", "name"]);
+    if (Object.keys(project).some((key) => !allowedKeys.has(key))) {
+      throw new AdoConfigError("INVALID_ADO_PROJECTS", "Azure DevOps discovery project contains unknown fields");
+    }
+    return {
+      id: requiredString(project.id, "project.id"),
+      name: requiredString(project.name ?? project.id, "project.name"),
+      repositories: [],
+    };
+  });
+  if (new Set(projects.map((project) => project.id)).size !== projects.length) {
+    throw new AdoConfigError("INVALID_ADO_PROJECTS", "Azure DevOps project IDs must be unique");
+  }
+  return projects;
+}
+
 function validateStateMapping(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new AdoConfigError(
@@ -225,6 +252,15 @@ export function createAdoConfigStore({ configPath }) {
     },
     validate(input) {
       return parseConfig({ ...input, version: CONFIG_VERSION });
+    },
+    validateDiscovery(input) {
+      return {
+        version: CONFIG_VERSION,
+        organization: validateOrganization(input.organization),
+        personalAccessToken: validateToken(input.personalAccessToken),
+        projects: validateDiscoveryProjects(input.projects),
+        stateMapping: {},
+      };
     },
     async save(input) {
       const config = parseConfig({ ...input, version: CONFIG_VERSION });

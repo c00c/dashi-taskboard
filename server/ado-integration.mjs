@@ -239,6 +239,7 @@ export function createAdoIntegration({
       repository: {
         id: String(repository.id),
         name: String(repository.name),
+        configuredProjectId: repository.configuredProject.id,
         projectId: String(repository.project?.id ?? repository.configuredProject.id),
         projectName,
       },
@@ -510,8 +511,31 @@ export function createAdoIntegration({
       activeStateMapping = candidate.stateMapping;
       await configStore.save(candidate);
     },
-    async discoverProjects() {
-      const config = await configStore.read();
+    async discoverProjects(input) {
+      const current = await configStore.read();
+      let config = current;
+      if (input) {
+        const personalAccessToken = input.personalAccessToken || current?.personalAccessToken;
+        if (
+          !input.personalAccessToken
+          && (!current || input.organization !== current.organization)
+        ) {
+          throw new ExternalWorkProviderError(
+            400,
+            "ADO_TOKEN_REQUIRED",
+            "A personal access token is required when discovering a new Azure DevOps organization",
+          );
+        }
+        try {
+          config = configStore.validateDiscovery({ ...input, personalAccessToken });
+        } catch (error) {
+          throw new ExternalWorkProviderError(
+            400,
+            error?.code ?? "INVALID_ADO_CONFIG",
+            error instanceof Error ? error.message : "Azure DevOps discovery configuration is invalid",
+          );
+        }
+      }
       if (!config) {
         throw new ExternalWorkProviderError(
           409,
@@ -520,7 +544,7 @@ export function createAdoIntegration({
         );
       }
       const repositories = await listRepositories(config);
-      await validateRepositoryMappings(config, repositories);
+      if (!input) await validateRepositoryMappings(config, repositories);
       return repositories.map((repository) => mappedProject(config, repository));
     },
     async discoverActors() {
