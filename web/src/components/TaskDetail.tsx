@@ -16,6 +16,7 @@ import {
   listAttachments,
   listComments,
   listExternalWorkActors,
+  listExternalWorkProviders,
   listTaskActivities,
   resolveTaskboardUrl,
   uploadAttachment,
@@ -52,6 +53,11 @@ import {
   actorKey,
   assigneeTargetForActor,
 } from "../actors";
+import {
+  canMutateTaskField,
+  externalWriteSetFor,
+  type ExternalWriteSet,
+} from "../externalWriteSet";
 import { ActorAvatar } from "./ActorAvatar";
 import { STATUS_DETAILS } from "./BoardColumn";
 import { LabelPicker } from "./LabelPicker";
@@ -417,6 +423,7 @@ export function TaskDetail({
   >(null);
   const [savingProperty, setSavingProperty] = useState<string | null>(null);
   const [externalAssignees, setExternalAssignees] = useState<ActorIdentity[]>([]);
+  const [externalWriteSet, setExternalWriteSet] = useState<ExternalWriteSet | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachmentsError, setAttachmentsError] = useState<TaskDetailError | null>(null);
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
@@ -489,6 +496,21 @@ export function TaskDetail({
     );
     return () => controller.abort();
   }, [task.id, task.source]);
+
+  useEffect(() => {
+    if (task.source === "local") {
+      setExternalWriteSet(null);
+      return;
+    }
+    const controller = new AbortController();
+    void listExternalWorkProviders(controller.signal).then(
+      (providers) => setExternalWriteSet(externalWriteSetFor(providers, task.source)),
+      (error) => {
+        if ((error as Error).name !== "AbortError") onError(messageFor(error));
+      },
+    );
+    return () => controller.abort();
+  }, [task.source]);
 
   useEffect(() => {
     if (!editingDescription) return;
@@ -1018,16 +1040,26 @@ export function TaskDetail({
   ) {
     developmentOptions.unshift(currentTask.developmentContext);
   }
-  const assigneeOptions = currentTask.source !== "local"
+  const assigneeOptions = (currentTask.source !== "local"
     ? [
       currentTask.assignee,
       ...externalAssignees,
       ...(externalAssignees.length > 0 ? [UNASSIGNED_ACTOR] : []),
     ]
-    : [currentTask.assignee, currentUser, CODEX_AGENT_ACTOR]
+    : [currentTask.assignee, currentUser, CODEX_AGENT_ACTOR])
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));
+  const canEdit = (field: string) => canMutateTaskField(
+    currentTask.source,
+    field,
+    externalWriteSet,
+  );
+  const externallyOwned = text(
+    "该字段由外部系统管理，无法在 Taskboard 中修改。",
+    "This field is owned by the external system and cannot be edited in Taskboard.",
+  );
+  const lockedTitle = (field: string) => (canEdit(field) ? undefined : externallyOwned);
   const visibleTaskAttachments = attachments.filter(
     (attachment) => attachment.kind === "attachment",
   );
@@ -1065,7 +1097,8 @@ export function TaskDetail({
                   rows={1}
                   value={title}
                   aria-label={text("议题标题", "Issue title")}
-                  disabled={savingProperty === "title"}
+                  disabled={!canEdit("title") || savingProperty === "title"}
+                  title={lockedTitle("title")}
                   onChange={(event) => {
                     setTitle(event.target.value.replace(/\n/g, ""));
                     resizeTextarea(event.currentTarget);
@@ -1122,15 +1155,20 @@ export function TaskDetail({
                 ) : (
                   <div
                     className={`issue-description-read${description ? "" : " empty"}`}
-                    role="button"
-                    tabIndex={0}
-                    aria-label={text("编辑议题描述", "Edit issue description")}
+                    role={canEdit("description") ? "button" : undefined}
+                    tabIndex={canEdit("description") ? 0 : undefined}
+                    aria-label={canEdit("description")
+                      ? text("编辑议题描述", "Edit issue description")
+                      : text("议题描述", "Issue description")}
+                    title={lockedTitle("description")}
                     onClick={() => {
+                      if (!canEdit("description")) return;
                       if (window.getSelection()?.isCollapsed === false) return;
                       setDescriptionSegments(createInlineMediaSegments(description, referenceTasks));
                       setEditingDescription(true);
                     }}
                     onKeyDown={(event) => {
+                      if (!canEdit("description")) return;
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
                         setDescriptionSegments(createInlineMediaSegments(description, referenceTasks));
@@ -1713,7 +1751,8 @@ export function TaskDetail({
                   icon: <StatusIcon status={status} color="currentColor" size={14} />,
                 }))}
                 open={propertyMenu === "status"}
-                disabled={savingProperty === "status"}
+                disabled={!canEdit("status") || savingProperty === "status"}
+                title={lockedTitle("status")}
                 className="detail-property-picker"
                 triggerClassName="detail-property-trigger"
                 triggerContent={(
@@ -1742,7 +1781,8 @@ export function TaskDetail({
                   className: `priority-${priority}`,
                 }))}
                 open={propertyMenu === "priority"}
-                disabled={savingProperty === "priority"}
+                disabled={!canEdit("priority") || savingProperty === "priority"}
+                title={lockedTitle("priority")}
                 className="detail-property-picker"
                 triggerClassName="detail-property-trigger"
                 ariaLabel={text("优先级", "Priority")}
@@ -1762,7 +1802,8 @@ export function TaskDetail({
                   icon: <ActorAvatar actor={actor} className="task-property-assignee-avatar" />,
                 }))}
                 open={propertyMenu === "assignee"}
-                disabled={currentTask.source === "jira" || savingProperty === "assignee"}
+                disabled={!canEdit("assignee") || savingProperty === "assignee"}
+                title={lockedTitle("assignee")}
                 className="detail-property-picker"
                 triggerClassName="detail-property-trigger"
                 ariaLabel={text("负责人", "Assignee")}
@@ -1789,9 +1830,9 @@ export function TaskDetail({
                 availableLabels={availableLabels}
                 selectedLabels={currentTask.labels}
                 open={propertyMenu === "labels"}
-                disabled={savingProperty === "labels"}
-                className="detail-label-picker"
-                triggerClassName="detail-label-trigger"
+                disabled={!canEdit("labels") || savingProperty === "labels"}
+                title={lockedTitle("labels")}
+                className="detail-label-picker"                triggerClassName="detail-label-trigger"
                 showSelectedAsChips
                 placeholder={text("添加标签…", "Add labels…")}
                 onOpenChange={(open) => setPropertyMenu(open ? "labels" : null)}
@@ -1821,12 +1862,19 @@ export function TaskDetail({
                   })),
                 ]}
                 open={propertyMenu === "development"}
-                disabled={developmentScanLoading || savingProperty === "developmentContext"}
+                disabled={
+                  !canEdit("developmentContext")
+                  || developmentScanLoading
+                  || savingProperty === "developmentContext"
+                }
+                title={lockedTitle("developmentContext")
+                  ?? (currentTask.developmentContext?.type === "worktree"
+                    ? currentTask.developmentContext.path
+                    : undefined)}
                 className="detail-property-picker"
                 popoverClassName="development-context-popover"
                 triggerClassName="detail-property-trigger"
                 ariaLabel={text("开发上下文", "Development context")}
-                title={currentTask.developmentContext?.type === "worktree" ? currentTask.developmentContext.path : undefined}
                 onOpenChange={(open) => setPropertyMenu(open ? "development" : null)}
                 onChange={(value) => void saveTask({
                   developmentContext: value ? JSON.parse(value) as DevelopmentContext : null,
@@ -1848,7 +1896,8 @@ export function TaskDetail({
               <input
                 type="date"
                 value={currentTask.startDate ?? ""}
-                disabled={savingProperty === "startDate"}
+                disabled={!canEdit("startDate") || savingProperty === "startDate"}
+                title={lockedTitle("startDate")}
                 onChange={(event) => void saveTask({
                   startDate: event.target.value || null,
                 }, "startDate")}
@@ -1869,7 +1918,8 @@ export function TaskDetail({
               <input
                 type="date"
                 value={currentTask.dueDate ?? ""}
-                disabled={savingProperty === "dueDate"}
+                disabled={!canEdit("dueDate") || savingProperty === "dueDate"}
+                title={lockedTitle("dueDate")}
                 onChange={(event) => void saveTask({
                   dueDate: event.target.value || null,
                   ...(event.target.value ? {} : { recurrence: null }),
@@ -1888,7 +1938,8 @@ export function TaskDetail({
                   { value: "year", label: text("每年", "Yearly"), icon: <RecurrenceIcon color="currentColor" size={14} /> },
                 ]}
                 open={propertyMenu === "recurrence"}
-                disabled={savingProperty === "recurrence"}
+                disabled={!canEdit("recurrence") || savingProperty === "recurrence"}
+                title={lockedTitle("recurrence")}
                 className="detail-property-picker"
                 triggerClassName="detail-property-trigger"
                 ariaLabel={text("重复", "Recurrence")}

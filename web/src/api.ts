@@ -238,6 +238,16 @@ export interface ExternalWorkProviderDescription {
   localOnlyMutations: string[];
 }
 
+export async function listExternalWorkProviders(
+  signal?: AbortSignal,
+): Promise<ExternalWorkProviderDescription[]> {
+  const data = await request<{ providers: ExternalWorkProviderDescription[] }>(
+    "/api/external-work/providers",
+    { signal },
+  );
+  return data.providers;
+}
+
 function isAdoConnection(value: unknown): value is AdoConnection {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const connection = value as Record<string, unknown>;
