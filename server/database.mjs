@@ -1359,9 +1359,10 @@ export class TaskboardDatabase {
         INSERT INTO projects (
           id, name, workspace_path, external_source, external_origin, external_id,
           external_url, labels, next_task_number, created_at, updated_at
-        ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 1, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           name = excluded.name,
+          workspace_path = excluded.workspace_path,
           external_source = excluded.external_source,
           external_origin = excluded.external_origin,
           external_id = excluded.external_id,
@@ -1373,6 +1374,7 @@ export class TaskboardDatabase {
         upsertProject.run(
           project.id,
           project.name,
+          project.workspacePath ?? null,
           providerId,
           project.externalOrigin,
           project.externalId,

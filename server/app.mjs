@@ -30,6 +30,8 @@ import {
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
 import { createExternalWorkProviderRegistry } from "./external-work-providers.mjs";
+import { createAdoConfigStore } from "./ado-config.mjs";
+import { createAdoIntegration } from "./ado-integration.mjs";
 import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
@@ -1610,6 +1612,8 @@ export function resolveServerOptions(options = {}) {
     databasePath: options.databasePath ?? path.join(dataDirectory, "taskboard.sqlite"),
     attachmentsDirectory: options.attachmentsDirectory ?? path.join(dataDirectory, "attachments"),
     cloudConfigPath: options.cloudConfigPath ?? path.join(dataDirectory, "cloud-companion.json"),
+    adoConfigPath: options.adoConfigPath
+      ?? path.join(dataDirectory, "external-work", "ado.json"),
     jiraConfigPath: options.jiraConfigPath ?? path.join(dataDirectory, "jira-connection.json"),
     clientStoragePath: options.clientStoragePath ?? path.join(dataDirectory, "client-storage.json"),
     staticDirectory: options.staticDirectory ?? path.join(PROJECT_ROOT, "dist", "web"),
@@ -1695,8 +1699,15 @@ export function createTaskboardServer(options = {}) {
     database,
     fetch: options.jiraFetch ?? globalThis.fetch,
   });
+  const adoConfig = options.adoConfigStore ?? createAdoConfigStore({
+    configPath: resolved.adoConfigPath,
+  });
+  const ado = createAdoIntegration({
+    configStore: adoConfig,
+    fetch: options.adoFetch ?? globalThis.fetch,
+  });
   const externalWorkProviders = createExternalWorkProviderRegistry({
-    providers: [jira.provider, ...(options.externalWorkProviders ?? [])],
+    providers: [jira.provider, ado.provider, ...(options.externalWorkProviders ?? [])],
     database,
   });
   const externalProviderOperations = new Map();

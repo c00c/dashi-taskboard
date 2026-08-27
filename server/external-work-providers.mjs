@@ -54,10 +54,27 @@ function normalizeProject(providerId, project) {
   if (!PROVIDER_ID_PATTERN.test(id)) {
     throw new Error("project.id must be a lowercase slug");
   }
+  const workspacePath = project?.workspacePath == null
+    ? undefined
+    : requireString(project.workspacePath, "project.workspacePath", 4096);
+  const repository = project?.repository == null
+    ? undefined
+    : {
+      id: requireString(project.repository.id, "project.repository.id", 256),
+      name: requireString(project.repository.name, "project.repository.name", 256),
+      projectId: requireString(project.repository.projectId, "project.repository.projectId", 256),
+      projectName: requireString(
+        project.repository.projectName,
+        "project.repository.projectName",
+        256,
+      ),
+    };
   return {
     id,
     name: requireString(project?.name, "project.name", 120),
     labels: Array.isArray(project?.labels) ? project.labels : [],
+    ...(workspacePath ? { workspacePath } : {}),
+    ...(repository ? { repository } : {}),
     externalOrigin: requireString(project?.externalOrigin, "project.externalOrigin", 512),
     externalId: requireString(project?.externalId, "project.externalId", 512),
     externalUrl: requireUrl(project?.externalUrl, "project.externalUrl"),
