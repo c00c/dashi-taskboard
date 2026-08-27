@@ -69,7 +69,9 @@ Install the user-scoped canvas extension from this checkout:
 npm run copilot:install-canvas
 ```
 
-The command builds the existing web application and links the versioned extension into `~/.copilot/extensions/taskboard`. Reload Copilot extensions or start a new Copilot session, then open the **Taskboard** canvas. Every panel reuses one loopback Taskboard service and the checkout's existing `.data` directory.
+The command builds the existing web application, links the versioned extension into `~/.copilot/extensions/taskboard`, and verifies the installed adapter, upstream runtime assets, existing-data API, and close/reopen path. Keep the customization checkout at its installed location, reload Copilot extensions or start a new Copilot session, then open the **Taskboard** canvas from any project. Every panel reuses one loopback Taskboard service and the checkout's existing `.data` directory.
+
+See [Upgrading the Copilot canvas overlay](docs/copilot-canvas-upgrades.md) for the non-rewriting upstream merge and post-merge validation workflow.
 
 ## Embed in Codex
 

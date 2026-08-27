@@ -69,7 +69,9 @@ ln -s /absolute/path/to/codex-taskboard/skills/manage-taskboard \
 npm run copilot:install-canvas
 ```
 
-该命令会构建现有 Web 应用，并将版本化扩展链接到 `~/.copilot/extensions/taskboard`。重新加载 Copilot 扩展或启动新的 Copilot 会话，然后打开 **Taskboard** Canvas。所有面板会复用同一个回环 Taskboard 服务和当前检出目录中的现有 `.data` 目录。
+该命令会构建现有 Web 应用，将版本化扩展链接到 `~/.copilot/extensions/taskboard`，并验证已安装的适配器、上游运行时资源、现有数据 API 以及关闭后重新打开的路径。请将定制检出目录保留在安装时的位置，重新加载 Copilot 扩展或启动新的 Copilot 会话，然后从任意项目打开 **Taskboard** Canvas。所有面板会复用同一个回环 Taskboard 服务和该检出目录中的现有 `.data` 目录。
+
+有关不重写历史的上游合并和合并后验证流程，请参阅[升级 Copilot Canvas overlay](docs/copilot-canvas-upgrades.md)。
 
 ## 嵌入 Codex
 
