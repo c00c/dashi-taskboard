@@ -2533,14 +2533,23 @@ export function App() {
     )));
 
     try {
-      const moved = await moveTaskRequest(task, status, sortOrder);
+      const externalAuthoritative = task.source !== "local" && task.source !== "jira";
+      const moved = await moveTaskRequest(
+        task,
+        status,
+        externalAuthoritative ? undefined : sortOrder,
+      );
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === moved.id ? moved : candidate,
       )));
       pushUndo(null, async () => {
         const candidate = tasksRef.current.find((current) => current.id === moved.id);
         const current = candidate && candidate.version >= moved.version ? candidate : moved;
-        const restored = await moveTaskRequest(current, previous.status, previous.sortOrder);
+        const restored = await moveTaskRequest(
+          current,
+          previous.status,
+          externalAuthoritative ? undefined : previous.sortOrder,
+        );
         setTasks((tasks) => sortTasks(tasks.map((item) => item.id === restored.id ? restored : item)));
       });
     } catch (error) {
@@ -2605,7 +2614,7 @@ export function App() {
     ));
 
     try {
-      const updated = await updateTaskRequest(task, { ...taskToDraft(task), ...changes });
+      const updated = await updateTaskRequest(task, changes);
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === updated.id ? updated : candidate,
       )));

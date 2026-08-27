@@ -20,6 +20,17 @@ function createAdoFixture() {
   const state = {
     title: "Synchronize ADO work",
     remoteStatus: "Active",
+    assignedTo: {
+      id: "ado-user-id",
+      displayName: "ADO User",
+      uniqueName: "ado@example.test",
+    },
+    comments: [],
+    mutationAccepted: false,
+    patchFailure: null,
+    failRefreshAfterMutation: false,
+    commentFailure: false,
+    paginateComments: false,
     requests: [],
   };
 
@@ -31,7 +42,9 @@ function createAdoFixture() {
         method: init.method ?? "GET",
         pathname: url.pathname,
         apiVersion: url.searchParams.get("api-version"),
+        continuationToken: url.searchParams.get("continuationToken"),
         authorization: init.headers?.authorization,
+        contentType: init.headers?.["content-type"],
         body: init.body ? JSON.parse(init.body) : null,
       });
 
@@ -51,6 +64,9 @@ function createAdoFixture() {
       }
 
       if (url.pathname === "/example-org/project-one/_apis/wit/workitemsbatch") {
+        if (state.failRefreshAfterMutation && state.mutationAccepted) {
+          return Response.json({ message: "refresh unavailable" }, { status: 503 });
+        }
         return Response.json({
           count: 1,
           value: [{
@@ -62,11 +78,7 @@ function createAdoFixture() {
               "System.Description": "Imported through Azure DevOps",
               "System.State": state.remoteStatus,
               "System.Tags": "ado; integration",
-              "System.AssignedTo": {
-                id: "ado-user-id",
-                displayName: "ADO User",
-                uniqueName: "ado@example.test",
-              },
+              ...(state.assignedTo ? { "System.AssignedTo": state.assignedTo } : {}),
               "System.CreatedBy": {
                 id: "ado-creator-id",
                 displayName: "ADO Creator",
@@ -78,6 +90,72 @@ function createAdoFixture() {
             },
           }],
         });
+      }
+
+      if (
+        url.pathname === "/example-org/project-one/_apis/wit/workitems/42"
+        && init.method === "PATCH"
+      ) {
+        if (state.patchFailure === "network") throw new Error("network unavailable");
+        if (state.patchFailure === "auth") {
+          return Response.json({ message: "unauthorized" }, { status: 401 });
+        }
+        if (state.patchFailure === "transition") {
+          return Response.json({ message: "invalid transition" }, { status: 400 });
+        }
+        for (const operation of JSON.parse(init.body)) {
+          if (operation.path === "/fields/System.State") state.remoteStatus = operation.value;
+          if (operation.path === "/fields/System.AssignedTo" && operation.op === "remove") {
+            state.assignedTo = null;
+          }
+          if (operation.path === "/fields/System.AssignedTo" && operation.op === "add") {
+            state.assignedTo = {
+              ...operation.value,
+              displayName: "Next ADO User",
+              uniqueName: "next@example.test",
+            };
+          }
+        }
+        state.mutationAccepted = true;
+        return Response.json({ id: 42, rev: 8, fields: {} });
+      }
+
+      if (
+        url.pathname === "/example-org/project-one/_apis/wit/workitems/42/comments"
+        && init.method === "POST"
+      ) {
+        if (state.commentFailure) {
+          return Response.json({ message: "comment rejected" }, { status: 400 });
+        }
+        const comment = {
+          workItemId: 42,
+          commentId: state.comments.length + 50,
+          version: 1,
+          text: JSON.parse(init.body).text,
+          createdBy: {
+            id: "comment-author-id",
+            displayName: "ADO Commenter",
+            uniqueName: "commenter@example.test",
+          },
+          createdDate: "2026-08-26T20:00:00.000Z",
+          modifiedDate: "2026-08-26T20:00:00.000Z",
+          isDeleted: false,
+        };
+        state.comments.push(comment);
+        return Response.json(comment);
+      }
+
+      if (
+        url.pathname === "/example-org/project-one/_apis/wit/workitems/42/comments"
+        && (init.method ?? "GET") === "GET"
+      ) {
+        if (state.paginateComments && !url.searchParams.get("continuationToken")) {
+          return Response.json(
+            { count: 0, comments: [] },
+            { headers: { "x-ms-continuationtoken": "next-page" } },
+          );
+        }
+        return Response.json({ count: state.comments.length, comments: state.comments });
       }
 
       throw new Error(`Unexpected ADO request: ${init.method ?? "GET"} ${url.pathname}`);
@@ -126,6 +204,22 @@ async function nextEvent(response, eventType) {
       return JSON.parse(data.slice(6));
     }
   }
+}
+
+async function configureAndSync(baseUrl, overrides = {}) {
+  const configured = await request(
+    baseUrl,
+    "/api/external-work/providers/ado/connection",
+    { method: "PUT", body: configuration(os.tmpdir(), overrides) },
+  );
+  assert.equal(configured.response.status, 200);
+  const synchronized = await request(
+    baseUrl,
+    "/api/external-work/providers/ado/sync",
+    { method: "POST" },
+  );
+  assert.equal(synchronized.response.status, 200);
+  return synchronized.body.tasks[0];
 }
 
 function configuration(workspacePath, overrides = {}) {
@@ -187,7 +281,8 @@ test("ADO discovery and synchronization are observable through the public provid
 
     const providers = await request(baseUrl, "/api/external-work/providers");
     const provider = providers.body.providers.find((candidate) => candidate.id === "ado");
-    assert.deepEqual(provider.supportedMutations, []);
+    assert.deepEqual(provider.supportedMutations, ["status", "assignee"]);
+    assert.equal(provider.supportsComments, true);
     assert.equal(provider.connection.organization, "example-org");
 
     const discovery = await request(baseUrl, "/api/external-work/providers/ado/projects");
@@ -231,6 +326,92 @@ test("ADO discovery and synchronization are observable through the public provid
     );
     assert.deepEqual(task.labels, ["ado", "integration"]);
 
+    const moved = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}/move`, {
+      method: "POST",
+      body: { version: task.version, status: "in_review" },
+    });
+    assert.equal(moved.response.status, 200);
+    assert.equal(moved.body.task.status, "in_review");
+
+    const unassigned = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
+      method: "PATCH",
+      body: { version: moved.body.task.version, assigneeTarget: "unassigned" },
+    });
+    assert.equal(unassigned.response.status, 200);
+    assert.equal(unassigned.body.task.assignee.id, "unassigned");
+
+    const assigned = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
+      method: "PATCH",
+      headers: {
+        "x-taskboard-user-id": "33333333-3333-3333-3333-333333333333",
+        "x-taskboard-user-name": "Next%20ADO%20User",
+      },
+      body: {
+        version: unassigned.body.task.version,
+        assigneeTarget: "current-user",
+      },
+    });
+    assert.equal(assigned.response.status, 200);
+    assert.equal(
+      assigned.body.task.assignee.id,
+      "ado:33333333-3333-3333-3333-333333333333",
+    );
+
+    const rejectedReorder = await request(
+      baseUrl,
+      `/api/tasks/${encodeURIComponent(task.id)}/move`,
+      {
+        method: "POST",
+        body: {
+          version: assigned.body.task.version,
+          status: assigned.body.task.status,
+          sortOrder: 2048,
+        },
+      },
+    );
+    assert.equal(rejectedReorder.response.status, 409);
+    assert.equal(rejectedReorder.body.error.code, "EXTERNAL_MUTATION_UNSUPPORTED");
+
+    ado.state.paginateComments = true;
+    const commented = await request(
+      baseUrl,
+      `/api/tasks/${encodeURIComponent(task.id)}/comments`,
+      { method: "POST", body: { body: "Remote-authoritative comment" } },
+    );
+    assert.equal(commented.response.status, 201, JSON.stringify(commented.body));
+    assert.equal(commented.body.comment.id.includes(":comment:50"), true);
+    assert.equal(commented.body.comment.body, "Remote-authoritative comment");
+    assert.equal(commented.body.comment.authorName, "ADO Commenter");
+    const visibleComments = await request(
+      baseUrl,
+      `/api/tasks/${encodeURIComponent(task.id)}/comments`,
+    );
+    assert.deepEqual(
+      visibleComments.body.comments.map((comment) => comment.body),
+      ["Remote-authoritative comment"],
+    );
+
+    const patches = ado.state.requests.filter((entry) => entry.method === "PATCH");
+    assert.deepEqual(patches.map((entry) => entry.body), [
+      [{ op: "add", path: "/fields/System.State", value: "Resolved" }],
+      [{ op: "remove", path: "/fields/System.AssignedTo" }],
+      [{
+        op: "add",
+        path: "/fields/System.AssignedTo",
+        value: { id: "33333333-3333-3333-3333-333333333333" },
+      }],
+    ]);
+    assert.equal(
+      patches.every((entry) => entry.contentType === "application/json-patch+json"),
+      true,
+    );
+    const commentCalls = ado.state.requests.filter(
+      (entry) => entry.pathname.endsWith("/comments"),
+    );
+    assert.deepEqual(commentCalls.map((entry) => entry.method), ["POST", "GET", "GET"]);
+    assert.equal(commentCalls[2].continuationToken, "next-page");
+    assert.deepEqual(commentCalls[0].body, { text: "Remote-authoritative comment" });
+
     const event = await eventPromise;
     assert.equal(event.providerId, "ado");
     assert.deepEqual(event.projectIds, ["ado-11111111-1111-1111-1111-111111111111"]);
@@ -241,7 +422,7 @@ test("ADO discovery and synchronization are observable through the public provid
     assert.equal(project.workspacePath, directory);
     assert.equal(project.externalId, "11111111-1111-1111-1111-111111111111");
 
-    const firstVersion = task.version;
+    const firstVersion = assigned.body.task.version;
     const refreshed = await request(
       baseUrl,
       "/api/external-work/providers/ado/sync",
@@ -308,4 +489,87 @@ test("ADO rejects unmapped states without partially persisting a snapshot", asyn
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("ADO write failures remain explicit and never create success-shaped local state", async () => {
+  const cases = [
+    ["auth", "ADO_AUTH_FAILED"],
+    ["transition", "ADO_REQUEST_FAILED"],
+    ["network", "ADO_MUTATION_INDETERMINATE"],
+  ];
+  for (const [failure, expectedCode] of cases) {
+    const ado = createAdoFixture();
+    const { baseUrl } = await startServer(ado.fetch);
+    const task = await configureAndSync(baseUrl);
+    ado.state.patchFailure = failure;
+    const failed = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}/move`, {
+      method: "POST",
+      body: { version: task.version, status: "in_review" },
+    });
+    assert.equal(failed.response.status >= 400, true);
+    assert.equal(failed.body.error.code, expectedCode);
+    const unchanged = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`);
+    assert.equal(unchanged.body.task.status, "in_progress");
+  }
+
+  const ambiguous = createAdoFixture();
+  const { baseUrl: ambiguousBaseUrl } = await startServer(ambiguous.fetch);
+  const ambiguousTask = await configureAndSync(ambiguousBaseUrl, {
+    stateMapping: {
+      New: "todo",
+      Active: "in_progress",
+      Resolved: "in_review",
+      "Ready for review": "in_review",
+      Closed: "done",
+    },
+  });
+  const rejectedMapping = await request(
+    ambiguousBaseUrl,
+    `/api/tasks/${encodeURIComponent(ambiguousTask.id)}/move`,
+    {
+      method: "POST",
+      body: { version: ambiguousTask.version, status: "in_review" },
+    },
+  );
+  assert.equal(rejectedMapping.response.status, 409);
+  assert.equal(rejectedMapping.body.error.code, "ADO_STATE_MAPPING_AMBIGUOUS");
+  assert.equal(ambiguous.state.requests.some((entry) => entry.method === "PATCH"), false);
+
+  const refresh = createAdoFixture();
+  const { baseUrl: refreshBaseUrl } = await startServer(refresh.fetch);
+  const refreshTask = await configureAndSync(refreshBaseUrl);
+  refresh.state.failRefreshAfterMutation = true;
+  const indeterminate = await request(
+    refreshBaseUrl,
+    `/api/tasks/${encodeURIComponent(refreshTask.id)}/move`,
+    {
+      method: "POST",
+      body: { version: refreshTask.version, status: "in_review" },
+    },
+  );
+  assert.equal(indeterminate.response.status, 502);
+  assert.equal(indeterminate.body.error.code, "ADO_REFRESH_FAILED");
+  const locallyUnchanged = await request(
+    refreshBaseUrl,
+    `/api/tasks/${encodeURIComponent(refreshTask.id)}`,
+  );
+  assert.equal(locallyUnchanged.body.task.status, "in_progress");
+  assert.equal(refresh.state.remoteStatus, "Resolved");
+
+  const comments = createAdoFixture();
+  const { baseUrl: commentsBaseUrl } = await startServer(comments.fetch);
+  const commentTask = await configureAndSync(commentsBaseUrl);
+  comments.state.commentFailure = true;
+  const failedComment = await request(
+    commentsBaseUrl,
+    `/api/tasks/${encodeURIComponent(commentTask.id)}/comments`,
+    { method: "POST", body: { body: "Must not appear locally" } },
+  );
+  assert.equal(failedComment.response.status, 409);
+  assert.equal(failedComment.body.error.code, "ADO_REQUEST_FAILED");
+  const localComments = await request(
+    commentsBaseUrl,
+    `/api/tasks/${encodeURIComponent(commentTask.id)}/comments`,
+  );
+  assert.deepEqual(localComments.body.comments, []);
 });

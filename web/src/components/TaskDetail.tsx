@@ -47,6 +47,7 @@ import type {
 } from "../types";
 import {
   CODEX_AGENT_ACTOR,
+  UNASSIGNED_ACTOR,
   actorKey,
   assigneeTargetForActor,
 } from "../actors";
@@ -1000,7 +1001,9 @@ export function TaskDetail({
   ) {
     developmentOptions.unshift(currentTask.developmentContext);
   }
-  const assigneeOptions = [currentTask.assignee, currentUser, CODEX_AGENT_ACTOR]
+  const assigneeOptions = currentTask.source !== "local" && currentTask.source !== "jira"
+    ? [currentTask.assignee, UNASSIGNED_ACTOR]
+    : [currentTask.assignee, currentUser, CODEX_AGENT_ACTOR]
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));

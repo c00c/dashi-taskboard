@@ -2698,8 +2698,8 @@ export class TaskboardDatabase {
   }
 
   createComment(taskId, input) {
-    const id = randomUUID();
-    const timestamp = now();
+    const id = input.id ?? randomUUID();
+    const timestamp = input.createdAt ?? now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(taskId);

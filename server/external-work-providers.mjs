@@ -125,6 +125,40 @@ function normalizeTask(provider, task, index, projects) {
   };
 }
 
+function persistSnapshot(database, provider, snapshot) {
+  const projects = (snapshot?.projects ?? []).map((project) => normalizeProject(provider.id, project));
+  for (const project of projects) {
+    const existing = database.getProject(project.id);
+    if (
+      existing
+      && (
+        existing.source !== provider.id
+        || existing.externalOrigin !== project.externalOrigin
+        || existing.externalId !== project.externalId
+      )
+    ) {
+      throw new ExternalWorkProviderError(
+        409,
+        "EXTERNAL_PROJECT_ID_CONFLICT",
+        `Project id '${project.id}' is already bound to another source`,
+      );
+    }
+  }
+  const projectIds = new Set(projects.map((project) => project.id));
+  const tasks = (snapshot?.tasks ?? []).map((task, index) => (
+    normalizeTask(provider, task, index, projectIds)
+  ));
+  database.syncExternalWork(provider.id, { projects, tasks });
+  return {
+    projects: projects.map((project) => database.getProject(project.id)),
+    tasks: tasks.map((task) => database.getTaskByExternalIdentity(
+      provider.id,
+      task.externalOrigin,
+      task.externalId,
+    )),
+  };
+}
+
 export function createExternalWorkProviderRegistry({ providers = [], database }) {
   const providerMap = new Map();
   for (const provider of providers) {
@@ -154,6 +188,8 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
       id,
       displayName: requireString(provider.displayName, "provider.displayName", 120),
       supportedMutations,
+      supportsComments: provider.supportsComments === true,
+      authoritativeMutations: provider.authoritativeMutations === true,
       managesSynchronization: provider.managesSynchronization === true,
       getConnection: (...args) => provider.getConnection(...args),
       configure: (...args) => provider.configure(...args),
@@ -161,7 +197,13 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
       synchronize: (...args) => provider.synchronize(...args),
       mapStatus: (...args) => provider.mapStatus(...args),
       mutateTask: (...args) => provider.mutateTask(...args),
+      addComment: typeof provider.addComment === "function"
+        ? (...args) => provider.addComment(...args)
+        : null,
     });
+    if (provider.supportsComments === true && typeof provider.addComment !== "function") {
+      throw new Error(`External work provider '${id}' must implement addComment()`);
+    }
   }
 
   function get(providerId) {
@@ -178,12 +220,22 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
       displayName: provider.displayName,
       connection: await provider.getConnection(),
       supportedMutations: provider.supportedMutations,
+      ...(provider.supportsComments ? { supportsComments: true } : {}),
     };
   }
 
   return {
     has(providerId) {
       return providerMap.has(providerId);
+    },
+    supportsComments(providerId) {
+      return get(providerId).supportsComments;
+    },
+    supportsMutation(providerId, mutation) {
+      return get(providerId).supportedMutations.includes(mutation);
+    },
+    hasAuthoritativeMutations(providerId) {
+      return get(providerId).authoritativeMutations;
     },
     async list() {
       return Promise.all([...providerMap.values()].map(describe));
@@ -213,37 +265,10 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
           tasks: snapshot?.tasks ?? [],
         };
       }
-      const projects = (snapshot?.projects ?? []).map((project) => normalizeProject(provider.id, project));
-      for (const project of projects) {
-        const existing = database.getProject(project.id);
-        if (
-          existing
-          && (
-            existing.source !== provider.id
-            || existing.externalOrigin !== project.externalOrigin
-            || existing.externalId !== project.externalId
-          )
-        ) {
-          throw new ExternalWorkProviderError(
-            409,
-            "EXTERNAL_PROJECT_ID_CONFLICT",
-            `Project id '${project.id}' is already bound to another source`,
-          );
-        }
-      }
-      const projectIds = new Set(projects.map((project) => project.id));
-      const tasks = (snapshot?.tasks ?? []).map((task, index) => (
-        normalizeTask(provider, task, index, projectIds)
-      ));
-      database.syncExternalWork(provider.id, { projects, tasks });
+      const persisted = persistSnapshot(database, provider, snapshot);
       return {
         provider: await describe(provider),
-        projects: projects.map((project) => database.getProject(project.id)),
-        tasks: tasks.map((task) => database.getTaskByExternalIdentity(
-          provider.id,
-          task.externalOrigin,
-          task.externalId,
-        )),
+        ...persisted,
       };
     },
     async mutateTask(providerId, task, changes) {
@@ -257,7 +282,7 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
           { supportedMutations: provider.supportedMutations },
         );
       }
-      return provider.mutateTask({
+      const result = await provider.mutateTask({
         identity: {
           providerId,
           origin: task.externalOrigin,
@@ -267,6 +292,53 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
         },
         changes,
       });
+      if (!result?.snapshot) return { authoritative: false, changed: result };
+      let persisted;
+      try {
+        persisted = persistSnapshot(database, provider, result.snapshot);
+      } catch {
+        throw new ExternalWorkProviderError(
+          502,
+          "EXTERNAL_REFRESH_PERSIST_FAILED",
+          "The external provider accepted the update, but Taskboard could not persist the authoritative refresh; synchronize to converge",
+        );
+      }
+      return {
+        authoritative: true,
+        task: persisted.tasks.find((candidate) => candidate.id === task.id)
+          ?? database.getTaskByExternalIdentity(providerId, task.externalOrigin, task.externalId),
+      };
+    },
+    async addComment(providerId, task, input) {
+      const provider = get(providerId);
+      if (!provider.supportsComments || !provider.addComment) {
+        throw new ExternalWorkProviderError(
+          409,
+          "EXTERNAL_COMMENT_UNSUPPORTED",
+          `Provider '${providerId}' does not support comments`,
+        );
+      }
+      const body = requireString(input.body, "comment.body", 100_000);
+      const comment = await provider.addComment({
+        identity: {
+          providerId,
+          origin: task.externalOrigin,
+          id: task.externalId,
+          key: task.externalKey,
+          url: task.externalUrl,
+        },
+        body,
+      });
+      const remoteId = requireString(comment?.id, "comment.id", 256);
+      return {
+        id: `external:${providerId}:comment:${createHash("sha256")
+          .update(`${task.externalOrigin}\0${task.externalId}\0${remoteId}`)
+          .digest("hex")
+          .slice(0, 32)}:comment:${remoteId}`.slice(0, 128),
+        body: requireString(comment?.body, "comment.body", 100_000),
+        actor: normalizeActor(comment?.actor, providerId),
+        createdAt: requireString(comment?.createdAt, "comment.createdAt", 64),
+      };
     },
   };
 }

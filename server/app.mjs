@@ -605,8 +605,12 @@ function actorFromRequest(request) {
 
 function parseAssigneeTarget(value) {
   if (value === undefined) return undefined;
-  if (value !== "current-user" && value !== "codex-agent") {
-    throw new ApiError(400, "INVALID_FIELD", "'assigneeTarget' must be current-user or codex-agent");
+  if (value !== "current-user" && value !== "codex-agent" && value !== "unassigned") {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'assigneeTarget' must be current-user, codex-agent, or unassigned",
+    );
   }
   return value;
 }
@@ -614,6 +618,9 @@ function parseAssigneeTarget(value) {
 function resolveAssignee(target, actor) {
   if (target === undefined) return actor;
   if (target === "codex-agent") return CODEX_AGENT_ACTOR;
+  if (target === "unassigned") {
+    return { type: "user", id: "unassigned", name: "Unassigned", avatarUrl: null };
+  }
   if (actor.type !== "user") {
     throw new ApiError(400, "INVALID_FIELD", "'current-user' requires a user request identity");
   }
@@ -2912,10 +2919,34 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Comment routes do not accept query parameters");
         }
         if (request.method === "POST") {
-          const comment = database.createComment(taskId, {
-            ...resolveInputThreadBinding(parseCommentCreate(await readJson(request))),
-            actor: actorFromRequest(request),
-          });
+          const input = resolveInputThreadBinding(parseCommentCreate(await readJson(request)));
+          const current = database.getTask(taskId);
+          if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+          const comment = current.source === "local"
+            || !externalWorkProviders.supportsComments(current.source)
+            ? database.createComment(taskId, {
+              ...input,
+              actor: actorFromRequest(request),
+            })
+            : await runExternalProviderOperation(current.source, async () => {
+              const authoritative = await externalWorkProviders.addComment(
+                current.source,
+                current,
+                input,
+              );
+              try {
+                return database.createComment(taskId, {
+                  ...input,
+                  ...authoritative,
+                });
+              } catch {
+                throw new ApiError(
+                  502,
+                  "EXTERNAL_COMMENT_PERSIST_FAILED",
+                  "The external provider accepted the comment, but Taskboard could not persist the authoritative result; synchronize to converge",
+                );
+              }
+            });
           const task = database.getTask(taskId);
           events.emit("comment.created", { comment, task });
           return sendJson(response, 201, { comment });
@@ -2939,6 +2970,19 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "PATCH") {
           const patch = resolveInputThreadBinding(parseCommentPatch(await readJson(request)));
+          const current = database.getComment(id);
+          const currentTask = current ? database.getTask(current.taskId) : null;
+          if (
+            currentTask
+            && currentTask.source !== "local"
+            && externalWorkProviders.supportsComments(currentTask.source)
+          ) {
+            throw new ApiError(
+              409,
+              "EXTERNAL_COMMENT_MUTATION_UNSUPPORTED",
+              "External comments cannot be edited in Taskboard",
+            );
+          }
           const comment = database.updateComment(
             id,
             patch.version,
@@ -2952,6 +2996,19 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "DELETE") {
           const { version } = parseArchive(await readJson(request));
+          const current = database.getComment(id);
+          const currentTask = current ? database.getTask(current.taskId) : null;
+          if (
+            currentTask
+            && currentTask.source !== "local"
+            && externalWorkProviders.supportsComments(currentTask.source)
+          ) {
+            throw new ApiError(
+              409,
+              "EXTERNAL_COMMENT_MUTATION_UNSUPPORTED",
+              "External comments cannot be deleted in Taskboard",
+            );
+          }
           const comment = database.deleteComment(id, version);
           for (const attachment of comment.attachments) {
             try {
@@ -3167,6 +3224,13 @@ export function createTaskboardServer(options = {}) {
           } = resolveInputThreadBinding(parseTaskPatch(await readJson(request)));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (assigneeTarget === "unassigned" && current.source === "local") {
+            throw new ApiError(
+              400,
+              "INVALID_FIELD",
+              "Local tasks do not support an unassigned assignee",
+            );
+          }
           const externalProviderId = current.source !== "local" ? current.source : null;
           if (externalProviderId) {
             return await runExternalProviderOperation(externalProviderId, async () => {
@@ -3194,6 +3258,16 @@ export function createTaskboardServer(options = {}) {
               if (externalProviderId === "jira" && assigneeTarget !== undefined) {
                 throw new ApiError(409, "JIRA_ASSIGNEE_UNAVAILABLE", "请在 Jira 中修改经办人");
               }
+              if (
+                assigneeTarget === "unassigned"
+                && !externalWorkProviders.supportsMutation(externalProviderId, "assignee")
+              ) {
+                throw new ApiError(
+                  409,
+                  "EXTERNAL_MUTATION_UNSUPPORTED",
+                  "This external provider does not support unassignment",
+                );
+              }
               const dueDate = Object.hasOwn(changes, "dueDate") ? changes.dueDate : latest.dueDate;
               const recurrence = Object.hasOwn(changes, "recurrence")
                 ? changes.recurrence
@@ -3205,11 +3279,16 @@ export function createTaskboardServer(options = {}) {
               if (assigneeTarget !== undefined) {
                 providerChanges.assignee = resolveAssignee(assigneeTarget, actor);
               }
-              const providerChanged = await externalWorkProviders.mutateTask(
+              const providerResult = await externalWorkProviders.mutateTask(
                 externalProviderId,
                 latest,
                 providerChanges,
               );
+              if (providerResult.authoritative) {
+                const task = providerResult.task;
+                events.emit("task.updated", { task });
+                return sendJson(response, 200, { task });
+              }
               if (assigneeTarget !== undefined) changes.assignee = providerChanges.assignee;
               let task;
               try {
@@ -3222,7 +3301,7 @@ export function createTaskboardServer(options = {}) {
                   actor,
                 );
               } catch (error) {
-                if (externalProviderId === "jira" && providerChanged) {
+                if (externalProviderId === "jira" && providerResult.changed) {
                   try {
                     await externalWorkProviders.synchronize("jira", {
                       force: true,
@@ -3296,12 +3375,37 @@ export function createTaskboardServer(options = {}) {
               if (latest.archivedAt !== null) {
                 throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
               }
+              if (
+                move.status === latest.status
+                && externalWorkProviders.hasAuthoritativeMutations(latest.source)
+              ) {
+                throw new ApiError(
+                  409,
+                  "EXTERNAL_MUTATION_UNSUPPORTED",
+                  "This external task does not support local-only reordering",
+                );
+              }
+              if (
+                move.sortOrder !== undefined
+                && externalWorkProviders.hasAuthoritativeMutations(latest.source)
+              ) {
+                throw new ApiError(
+                  409,
+                  "EXTERNAL_MUTATION_UNSUPPORTED",
+                  "This external task does not support local-only reordering",
+                );
+              }
               if (move.status !== latest.status) {
-                await externalWorkProviders.mutateTask(
+                const providerResult = await externalWorkProviders.mutateTask(
                   latest.source,
                   latest,
                   { status: move.status },
                 );
+                if (providerResult.authoritative) {
+                  const task = providerResult.task;
+                  events.emit("task.moved", { task });
+                  return sendJson(response, 200, { task });
+                }
               }
               const task = database.moveTask(
                 id,

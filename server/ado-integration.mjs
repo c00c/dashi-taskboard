@@ -21,6 +21,7 @@ const WORK_ITEM_FIELDS = [
   "Microsoft.VSTS.Common.Priority",
 ];
 const TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504]);
+const ADO_IDENTITY_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function safeConnection(config) {
   if (!config) {
@@ -65,6 +66,13 @@ function actorFromIdentity(identity, fallback) {
   };
 }
 
+const UNASSIGNED_ACTOR = {
+  type: "user",
+  id: "unassigned",
+  name: "Unassigned",
+  avatarUrl: null,
+};
+
 function priorityFromWorkItem(value) {
   if (value === 1) return "urgent";
   if (value === 2) return "high";
@@ -97,6 +105,12 @@ export function createAdoIntegration({
   async function request(config, projectId, apiPath, init = {}) {
     const url = new URL(adoUrl(config, projectId, apiPath));
     url.searchParams.set("api-version", API_VERSION);
+    const {
+      retryable = (init.method ?? "GET") === "GET",
+      indeterminateCode,
+      returnResponseMetadata = false,
+      ...fetchInit
+    } = init;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -104,43 +118,54 @@ export function createAdoIntegration({
       let response;
       try {
         response = await fetchImplementation(url, {
-          ...init,
+          ...fetchInit,
           redirect: "manual",
           signal: controller.signal,
           headers: {
             accept: "application/json",
             authorization: `Basic ${Buffer.from(`:${config.personalAccessToken}`, "utf8").toString("base64")}`,
-            ...(init.body ? { "content-type": "application/json" } : {}),
-            ...init.headers,
+            ...(fetchInit.body ? { "content-type": "application/json" } : {}),
+            ...fetchInit.headers,
           },
         });
       } catch (error) {
         const timedOut = error instanceof Error && error.name === "AbortError";
-        if (attempt + 1 < MAX_ATTEMPTS) {
+        if (retryable && attempt + 1 < MAX_ATTEMPTS) {
           await new Promise((resolve) => setTimeout(resolve, 50 * (2 ** attempt)));
           continue;
         }
         throw new ExternalWorkProviderError(
           502,
-          timedOut ? "ADO_TIMEOUT" : "ADO_UNAVAILABLE",
+          indeterminateCode ?? (timedOut ? "ADO_TIMEOUT" : "ADO_UNAVAILABLE"),
           timedOut
-            ? "Azure DevOps request timed out"
-            : "Azure DevOps is unavailable; check the organization and network connection",
+            ? (indeterminateCode
+              ? "The Azure DevOps mutation may have succeeded, but its response timed out; synchronize before retrying"
+              : "Azure DevOps request timed out")
+            : (indeterminateCode
+              ? "The Azure DevOps mutation may have succeeded, but its response was lost; synchronize before retrying"
+              : "Azure DevOps is unavailable; check the organization and network connection"),
         );
       } finally {
         clearTimeout(timeout);
       }
 
-      if (TRANSIENT_STATUSES.has(response.status) && attempt + 1 < MAX_ATTEMPTS) {
+      if (TRANSIENT_STATUSES.has(response.status) && retryable && attempt + 1 < MAX_ATTEMPTS) {
         await response.body?.cancel();
         await new Promise((resolve) => setTimeout(resolve, 50 * (2 ** attempt)));
         continue;
+      }
+      if (TRANSIENT_STATUSES.has(response.status) && indeterminateCode) {
+        throw new ExternalWorkProviderError(
+          502,
+          indeterminateCode,
+          "Azure DevOps may have accepted the mutation before returning a transient failure; synchronize before retrying",
+        );
       }
       if (response.status === 401 || response.status === 403) {
         throw new ExternalWorkProviderError(
           401,
           "ADO_AUTH_FAILED",
-          "Azure DevOps authentication failed; check the personal access token and required read scopes",
+          "Azure DevOps authentication failed; check the personal access token and required work scopes",
         );
       }
       if (response.status >= 300 && response.status < 400) {
@@ -158,7 +183,8 @@ export function createAdoIntegration({
         );
       }
       try {
-        return await response.json();
+        const payload = await response.json();
+        return returnResponseMetadata ? { payload, headers: response.headers } : payload;
       } catch {
         throw new ExternalWorkProviderError(
           502,
@@ -254,6 +280,7 @@ export function createAdoIntegration({
             fields: WORK_ITEM_FIELDS,
             errorPolicy: "fail",
           }),
+          retryable: true,
         },
       );
       workItems.push(...responseValues(payload, "work item batch"));
@@ -296,10 +323,119 @@ export function createAdoIntegration({
     }
   }
 
+  async function synchronizeSnapshot() {
+    const config = await configStore.read();
+    if (!config) {
+      throw new ExternalWorkProviderError(
+        409,
+        "ADO_NOT_CONFIGURED",
+        "Azure DevOps is not configured",
+      );
+    }
+    activeStateMapping = config.stateMapping;
+    const repositories = await listRepositories(config);
+    await validateRepositoryMappings(config, repositories);
+    const repositoriesById = new Map(
+      repositories.map((repository) => [
+        `${repository.configuredProject.id}\0${String(repository.id)}`,
+        repository,
+      ]),
+    );
+    const projects = [];
+    const tasks = [];
+    for (const configuredProject of config.projects) {
+      for (const repositoryMapping of configuredProject.repositories) {
+        const repository = repositoriesById.get(
+          `${configuredProject.id}\0${repositoryMapping.id}`,
+        );
+        const project = mappedProject(config, repository);
+        projects.push(project);
+        const workItems = await fetchWorkItems(
+          config,
+          configuredProject,
+          repositoryMapping.workItemIds,
+        );
+        for (const [index, workItem] of workItems.entries()) {
+          const fields = workItem?.fields ?? {};
+          const externalId = String(workItem?.id ?? fields["System.Id"] ?? "");
+          if (!externalId) {
+            throw new ExternalWorkProviderError(
+              502,
+              "INVALID_ADO_RESPONSE",
+              "Azure DevOps returned a work item without a stable ID",
+            );
+          }
+          const remoteStatus = String(fields["System.State"] ?? "");
+          mapStatus(remoteStatus);
+          const creator = actorFromIdentity(fields["System.CreatedBy"], "ado-creator");
+          tasks.push({
+            projectId: project.id,
+            title: String(fields["System.Title"] ?? `Work item ${externalId}`).slice(0, 240),
+            description: typeof fields["System.Description"] === "string"
+              ? fields["System.Description"].slice(0, 100_000)
+              : "",
+            remoteStatus,
+            priority: priorityFromWorkItem(fields["Microsoft.VSTS.Common.Priority"]),
+            labels: labelsFromWorkItem(fields["System.Tags"]),
+            sortOrder: (index + 1) * 1024,
+            creator,
+            assignee: fields["System.AssignedTo"]
+              ? actorFromIdentity(fields["System.AssignedTo"], "ado-assignee")
+              : UNASSIGNED_ACTOR,
+            dueDate: null,
+            externalOrigin: originFor(config),
+            externalId,
+            externalKey: externalId,
+            externalUrl: adoUrl(
+              config,
+              configuredProject.id,
+              `/_workitems/edit/${encodeURIComponent(externalId)}`,
+            ),
+            createdAt: fields["System.CreatedDate"],
+            updatedAt: fields["System.ChangedDate"],
+          });
+        }
+      }
+    }
+    return { projects, tasks };
+  }
+
+  async function mutationContext(identity) {
+    const config = await configStore.read();
+    if (!config) {
+      throw new ExternalWorkProviderError(
+        409,
+        "ADO_NOT_CONFIGURED",
+        "Azure DevOps is not configured",
+      );
+    }
+    if (identity.origin !== originFor(config) || !/^[1-9]\d*$/.test(identity.id)) {
+      throw new ExternalWorkProviderError(
+        409,
+        "ADO_WORK_ITEM_IDENTITY_INVALID",
+        "The synchronized Azure DevOps work item identity is invalid",
+      );
+    }
+    const workItemId = Number(identity.id);
+    const matches = config.projects.filter((project) => project.repositories.some(
+      (repository) => repository.workItemIds.includes(workItemId),
+    ));
+    if (matches.length !== 1) {
+      throw new ExternalWorkProviderError(
+        409,
+        "ADO_WORK_ITEM_MAPPING_INVALID",
+        `Azure DevOps work item '${identity.id}' must belong to exactly one configured project`,
+      );
+    }
+    return { config, project: matches[0], workItemId };
+  }
+
   const provider = {
     id: "ado",
     displayName: "Azure DevOps",
-    supportedMutations: [],
+    supportedMutations: ["status", "assignee"],
+    supportsComments: true,
+    authoritativeMutations: true,
     async getConnection() {
       return safeConnection(await configStore.read());
     },
@@ -336,88 +472,131 @@ export function createAdoIntegration({
       return repositories.map((repository) => mappedProject(config, repository));
     },
     async synchronize() {
-      const config = await configStore.read();
-      if (!config) {
-        throw new ExternalWorkProviderError(
-          409,
-          "ADO_NOT_CONFIGURED",
-          "Azure DevOps is not configured",
-        );
-      }
-      activeStateMapping = config.stateMapping;
-      const repositories = await listRepositories(config);
-      await validateRepositoryMappings(config, repositories);
-      const repositoriesById = new Map(
-        repositories.map((repository) => [
-          `${repository.configuredProject.id}\0${String(repository.id)}`,
-          repository,
-        ]),
-      );
-      const projects = [];
-      const tasks = [];
-      for (const configuredProject of config.projects) {
-        for (const repositoryMapping of configuredProject.repositories) {
-          const repository = repositoriesById.get(
-            `${configuredProject.id}\0${repositoryMapping.id}`,
-          );
-          const project = mappedProject(config, repository);
-          projects.push(project);
-          const workItems = await fetchWorkItems(
-            config,
-            configuredProject,
-            repositoryMapping.workItemIds,
-          );
-          for (const [index, workItem] of workItems.entries()) {
-            const fields = workItem?.fields ?? {};
-            const externalId = String(workItem?.id ?? fields["System.Id"] ?? "");
-            if (!externalId) {
-              throw new ExternalWorkProviderError(
-                502,
-                "INVALID_ADO_RESPONSE",
-                "Azure DevOps returned a work item without a stable ID",
-              );
-            }
-            const remoteStatus = String(fields["System.State"] ?? "");
-            mapStatus(remoteStatus);
-            const creator = actorFromIdentity(fields["System.CreatedBy"], "ado-creator");
-            tasks.push({
-              projectId: project.id,
-              title: String(fields["System.Title"] ?? `Work item ${externalId}`).slice(0, 240),
-              description: typeof fields["System.Description"] === "string"
-                ? fields["System.Description"].slice(0, 100_000)
-                : "",
-              remoteStatus,
-              priority: priorityFromWorkItem(fields["Microsoft.VSTS.Common.Priority"]),
-              labels: labelsFromWorkItem(fields["System.Tags"]),
-              sortOrder: (index + 1) * 1024,
-              creator,
-              assignee: fields["System.AssignedTo"]
-                ? actorFromIdentity(fields["System.AssignedTo"], "ado-assignee")
-                : creator,
-              dueDate: null,
-              externalOrigin: originFor(config),
-              externalId,
-              externalKey: externalId,
-              externalUrl: adoUrl(
-                config,
-                configuredProject.id,
-                `/_workitems/edit/${encodeURIComponent(externalId)}`,
-              ),
-              createdAt: fields["System.CreatedDate"],
-              updatedAt: fields["System.ChangedDate"],
-            });
-          }
-        }
-      }
-      return { projects, tasks };
+      return synchronizeSnapshot();
     },
     mapStatus,
-    async mutateTask() {
-      throw new ExternalWorkProviderError(
-        409,
-        "ADO_MUTATION_UNAVAILABLE",
-        "Azure DevOps write-back is not enabled",
+    async mutateTask({ identity, changes }) {
+      const { config, project, workItemId } = await mutationContext(identity);
+      activeStateMapping = config.stateMapping;
+      const patch = [];
+      if (Object.hasOwn(changes, "status")) {
+        const remoteStates = Object.entries(config.stateMapping)
+          .filter(([, status]) => status === changes.status)
+          .map(([remoteState]) => remoteState);
+        if (remoteStates.length !== 1) {
+          throw new ExternalWorkProviderError(
+            409,
+            "ADO_STATE_MAPPING_AMBIGUOUS",
+            `Taskboard status '${changes.status}' must map to exactly one Azure DevOps state`,
+          );
+        }
+        patch.push({
+          op: "add",
+          path: "/fields/System.State",
+          value: remoteStates[0],
+        });
+      }
+      if (Object.hasOwn(changes, "assignee")) {
+        if (changes.assignee?.id === UNASSIGNED_ACTOR.id) {
+          patch.push({ op: "remove", path: "/fields/System.AssignedTo" });
+        } else {
+          const actorId = typeof changes.assignee?.id === "string"
+            ? changes.assignee.id
+            : "";
+          const identityId = actorId.startsWith("ado:") ? actorId.slice(4) : actorId;
+          if (changes.assignee?.type !== "user" || !ADO_IDENTITY_ID_PATTERN.test(identityId)) {
+            throw new ExternalWorkProviderError(
+              409,
+              "ADO_ASSIGNEE_IDENTITY_INVALID",
+              "Azure DevOps assignee changes require an ADO identity or explicit unassignment",
+            );
+          }
+          patch.push({
+            op: "add",
+            path: "/fields/System.AssignedTo",
+            value: { id: identityId },
+          });
+        }
+      }
+      await request(
+        config,
+        project.id,
+        `/_apis/wit/workitems/${workItemId}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json-patch+json" },
+          body: JSON.stringify(patch),
+          indeterminateCode: "ADO_MUTATION_INDETERMINATE",
+        },
       );
+      try {
+        return { snapshot: await synchronizeSnapshot() };
+      } catch {
+        throw new ExternalWorkProviderError(
+          502,
+          "ADO_REFRESH_FAILED",
+          "Azure DevOps accepted the update, but Taskboard could not refresh the authoritative work item; run synchronization to converge",
+        );
+      }
+    },
+    async addComment({ identity, body }) {
+      const { config, project, workItemId } = await mutationContext(identity);
+      const created = await request(
+        config,
+        project.id,
+        `/_apis/wit/workitems/${workItemId}/comments`,
+        {
+          method: "POST",
+          body: JSON.stringify({ text: body }),
+          indeterminateCode: "ADO_COMMENT_INDETERMINATE",
+        },
+      );
+      let comment = null;
+      let continuationToken = null;
+      try {
+        do {
+          const query = new URLSearchParams({ $top: "200" });
+          if (continuationToken) query.set("continuationToken", continuationToken);
+          const page = await request(
+            config,
+            project.id,
+            `/_apis/wit/workitems/${workItemId}/comments?${query}`,
+            { returnResponseMetadata: true },
+          );
+          const comments = Array.isArray(page.payload?.comments)
+            ? page.payload.comments
+            : responseValues(page.payload, "comment");
+          const createdId = String(created?.commentId ?? created?.id ?? "");
+          comment = comments.find((candidate) => (
+            String(candidate?.commentId ?? candidate?.id ?? "") === createdId
+          )) ?? null;
+          continuationToken = comment
+            ? null
+            : (page.headers.get("x-ms-continuationtoken")
+              ?? page.payload?.continuationToken
+              ?? null);
+        } while (continuationToken);
+      } catch {
+        throw new ExternalWorkProviderError(
+          502,
+          "ADO_COMMENT_REFRESH_FAILED",
+          "Azure DevOps accepted the comment, but Taskboard could not refresh it; run synchronization to converge",
+        );
+      }
+      const createdId = String(created?.commentId ?? created?.id ?? "");
+      if (!createdId || !comment || comment.isDeleted === true) {
+        throw new ExternalWorkProviderError(
+          502,
+          "ADO_COMMENT_REFRESH_FAILED",
+          "Azure DevOps accepted the comment, but the authoritative comment was not returned",
+        );
+      }
+      return {
+        id: createdId,
+        body: String(comment.text ?? ""),
+        actor: actorFromIdentity(comment.createdBy, "ado-commenter"),
+        createdAt: String(comment.createdDate ?? comment.modifiedDate ?? new Date().toISOString()),
+      };
     },
   };
 
