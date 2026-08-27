@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Taskboard Canvas Overlay — Build 1</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #152033;
+        --paper: #f4f7fb;
+        --panel: #ffffff;
+        --cobalt: #3157e3;
+        --teal: #0b8f83;
+        --signal: #f2b84b;
+        --muted: #667085;
+        --line: #cbd4e1;
+        --shadow: 0 20px 60px rgba(28, 48, 86, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background:
+          linear-gradient(rgba(49, 87, 227, 0.045) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(49, 87, 227, 0.045) 1px, transparent 1px),
+          var(--paper);
+        background-size: 28px 28px;
+        font-family: "Segoe UI", "Aptos", sans-serif;
+      }
+
+      button,
+      a {
+        font: inherit;
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .shell {
+        width: min(1180px, calc(100% - 40px));
+        margin: 0 auto;
+      }
+
+      .utility {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 22px 0;
+        color: var(--muted);
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .hero {
+        min-height: 76vh;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(340px, 0.74fr);
+        align-items: center;
+        gap: clamp(36px, 7vw, 96px);
+        padding: 72px 0 100px;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 24px;
+        color: var(--cobalt);
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow::before {
+        width: 32px;
+        height: 2px;
+        background: var(--cobalt);
+        content: "";
+      }
+
+      h1 {
+        max-width: 780px;
+        margin: 0;
+        font-family: "Arial Narrow", "Aptos Display", sans-serif;
+        font-size: clamp(58px, 8.8vw, 118px);
+        font-stretch: condensed;
+        font-weight: 800;
+        letter-spacing: -0.065em;
+        line-height: 0.83;
+      }
+
+      h1 span {
+        display: block;
+        color: var(--cobalt);
+      }
+
+      .lede {
+        max-width: 660px;
+        margin: 32px 0 0;
+        color: #3f4c63;
+        font-size: clamp(18px, 2vw, 24px);
+        line-height: 1.48;
+      }
+
+      .hero-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 34px;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 48px;
+        padding: 0 20px;
+        border: 1px solid var(--ink);
+        text-decoration: none;
+        font-weight: 700;
+      }
+
+      .button.primary {
+        color: white;
+        border-color: var(--cobalt);
+        background: var(--cobalt);
+      }
+
+      .button:focus-visible,
+      .path-step:focus-visible {
+        outline: 3px solid var(--signal);
+        outline-offset: 3px;
+      }
+
+      .overlay-rail {
+        position: relative;
+        min-height: 510px;
+        padding: 44px 32px;
+        overflow: hidden;
+        border: 1px solid rgba(49, 87, 227, 0.35);
+        background: rgba(255, 255, 255, 0.72);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(14px);
+      }
+
+      .overlay-rail::after {
+        position: absolute;
+        right: -84px;
+        bottom: -92px;
+        width: 240px;
+        height: 240px;
+        border: 34px solid rgba(11, 143, 131, 0.12);
+        border-radius: 50%;
+        content: "";
+      }
+
+      .rail-label {
+        color: var(--muted);
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .track {
+        position: relative;
+        display: grid;
+        grid-template-columns: 1fr 54px 1fr;
+        gap: 12px;
+        margin-top: 38px;
+      }
+
+      .track::before,
+      .track::after {
+        position: absolute;
+        top: 20px;
+        bottom: 20px;
+        width: 2px;
+        content: "";
+      }
+
+      .track::before {
+        left: calc(25% - 1px);
+        background: var(--ink);
+      }
+
+      .track::after {
+        right: calc(25% - 1px);
+        background: var(--teal);
+      }
+
+      .track-column {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        align-content: space-between;
+        min-height: 350px;
+      }
+
+      .track-column:last-child {
+        text-align: right;
+      }
+
+      .track-card {
+        padding: 13px 14px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .track-card strong {
+        display: block;
+        margin-bottom: 3px;
+        font-family: "Segoe UI", sans-serif;
+        font-size: 14px;
+      }
+
+      .merge {
+        display: grid;
+        place-items: center;
+      }
+
+      .merge-line {
+        width: 2px;
+        height: 100%;
+        background: linear-gradient(var(--ink), var(--signal) 44%, var(--teal));
+      }
+
+      .merge-badge {
+        position: absolute;
+        display: grid;
+        place-items: center;
+        width: 54px;
+        height: 54px;
+        color: var(--ink);
+        border: 2px solid var(--ink);
+        border-radius: 50%;
+        background: var(--signal);
+        font-family: "Cascadia Mono", monospace;
+        font-size: 18px;
+        font-weight: 800;
+      }
+
+      .section {
+        padding: 96px 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .section-heading {
+        display: grid;
+        grid-template-columns: 170px 1fr;
+        gap: 34px;
+        align-items: start;
+        margin-bottom: 46px;
+      }
+
+      .section-heading h2 {
+        max-width: 760px;
+        margin: 0;
+        font-family: "Arial Narrow", "Aptos Display", sans-serif;
+        font-size: clamp(40px, 5.8vw, 76px);
+        font-stretch: condensed;
+        letter-spacing: -0.045em;
+        line-height: 0.94;
+      }
+
+      .section-kicker {
+        color: var(--cobalt);
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      .path-layout {
+        display: grid;
+        grid-template-columns: minmax(280px, 0.75fr) minmax(0, 1.25fr);
+        gap: 30px;
+      }
+
+      .path-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .path-step {
+        width: 100%;
+        padding: 18px 20px;
+        color: var(--ink);
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.78);
+        cursor: pointer;
+        text-align: left;
+        transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+      }
+
+      .path-step:hover {
+        transform: translateX(4px);
+        border-color: var(--cobalt);
+      }
+
+      .path-step[aria-selected="true"] {
+        color: white;
+        border-color: var(--cobalt);
+        background: var(--cobalt);
+      }
+
+      .path-step strong {
+        display: block;
+        margin-bottom: 4px;
+        font-size: 16px;
+      }
+
+      .path-step span {
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 11px;
+        opacity: 0.78;
+      }
+
+      .inspector {
+        min-height: 390px;
+        padding: clamp(28px, 5vw, 54px);
+        color: white;
+        background: var(--ink);
+        box-shadow: var(--shadow);
+      }
+
+      .inspector-state {
+        color: #8fe0d7;
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 12px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      .inspector h3 {
+        max-width: 580px;
+        margin: 20px 0 16px;
+        font-family: "Arial Narrow", "Aptos Display", sans-serif;
+        font-size: clamp(36px, 5vw, 62px);
+        letter-spacing: -0.04em;
+        line-height: 0.96;
+      }
+
+      .inspector p {
+        max-width: 670px;
+        margin: 0;
+        color: #cbd4e1;
+        font-size: 18px;
+        line-height: 1.6;
+      }
+
+      .proof {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 30px;
+        color: var(--signal);
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 12px;
+      }
+
+      .proof::before {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: currentColor;
+        box-shadow: 0 0 0 6px rgba(242, 184, 75, 0.16);
+        content: "";
+      }
+
+      .capabilities {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 16px;
+      }
+
+      .capability {
+        min-height: 250px;
+        padding: 26px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.78);
+      }
+
+      .capability:nth-child(2) {
+        transform: translateY(20px);
+      }
+
+      .capability:nth-child(3) {
+        transform: translateY(40px);
+      }
+
+      .capability-code {
+        color: var(--teal);
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .capability h3 {
+        margin: 42px 0 14px;
+        font-size: 24px;
+        letter-spacing: -0.025em;
+      }
+
+      .capability p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.55;
+      }
+
+      .command {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 20px;
+        align-items: center;
+        padding: 28px 30px;
+        color: white;
+        background: var(--cobalt);
+      }
+
+      .command code {
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: clamp(14px, 2vw, 19px);
+      }
+
+      .command span {
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 11px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      footer {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 40px 0 60px;
+        color: var(--muted);
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 11px;
+      }
+
+      @media (max-width: 820px) {
+        .hero,
+        .path-layout {
+          grid-template-columns: 1fr;
+        }
+
+        .hero {
+          padding-top: 40px;
+        }
+
+        .overlay-rail {
+          min-height: 450px;
+        }
+
+        .section-heading {
+          grid-template-columns: 1fr;
+          gap: 12px;
+        }
+
+        .capabilities {
+          grid-template-columns: 1fr;
+        }
+
+        .capability:nth-child(2),
+        .capability:nth-child(3) {
+          transform: none;
+        }
+      }
+
+      @media (max-width: 520px) {
+        .shell {
+          width: min(100% - 24px, 1180px);
+        }
+
+        .utility {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 7px;
+        }
+
+        .hero {
+          min-height: auto;
+        }
+
+        .overlay-rail {
+          padding: 30px 18px;
+        }
+
+        .track {
+          grid-template-columns: 1fr 38px 1fr;
+        }
+
+        .merge-badge {
+          width: 42px;
+          height: 42px;
+          font-size: 14px;
+        }
+
+        .command {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        .path-step {
+          transition: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="shell utility">
+      <span>Agent Loop / Build 1 / Implement round 1</span>
+      <span>Copilot canvas + external work</span>
+    </header>
+
+    <main>
+      <section class="shell hero">
+        <div>
+          <div class="eyebrow">Taskboard, without the copy</div>
+          <h1>Keep upstream. <span>Add your layer.</span></h1>
+          <p class="lede">
+            One user-scoped Copilot canvas opens the Taskboard you already use,
+            preserves its data, and adds controlled host and Azure DevOps actions
+            through explicit adapters.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#operation-path">Inspect the operation path</a>
+            <a class="button" href="#install">See the install boundary</a>
+          </div>
+        </div>
+
+        <aside class="overlay-rail" aria-label="Upstream and personal overlay merge">
+          <div class="rail-label">The durable merge seam</div>
+          <div class="track">
+            <div class="track-column">
+              <div class="track-card">
+                <strong>Upstream Taskboard</strong>
+                Web app + loopback server
+              </div>
+              <div class="track-card">
+                <strong>Existing state</strong>
+                SQLite + attachments + preferences
+              </div>
+              <div class="track-card">
+                <strong>Jira behavior</strong>
+                Preserved behind provider contract
+              </div>
+            </div>
+            <div class="merge">
+              <div class="merge-line"></div>
+              <div class="merge-badge" aria-hidden="true">+</div>
+            </div>
+            <div class="track-column">
+              <div class="track-card">
+                <strong>Copilot overlay</strong>
+                Canvas + host actions
+              </div>
+              <div class="track-card">
+                <strong>External work seam</strong>
+                Provider-neutral synchronization
+              </div>
+              <div class="track-card">
+                <strong>Azure DevOps</strong>
+                Repos + work items + bounded writes
+              </div>
+            </div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="section" id="operation-path">
+        <div class="shell">
+          <div class="section-heading">
+            <div class="section-kicker">Observable path</div>
+            <h2>Every action crosses a named boundary.</h2>
+          </div>
+
+          <div class="path-layout">
+            <div class="path-list" role="tablist" aria-label="Operation path stages">
+              <button class="path-step" role="tab" aria-selected="true" data-step="canvas">
+                <strong>Open the canvas</strong>
+                <span>createCanvas → loopback URL</span>
+              </button>
+              <button class="path-step" role="tab" aria-selected="false" data-step="host">
+                <strong>Act through Copilot</strong>
+                <span>token → sendAndWait</span>
+              </button>
+              <button class="path-step" role="tab" aria-selected="false" data-step="sync">
+                <strong>Synchronize ADO</strong>
+                <span>REST 7.1 → provider registry</span>
+              </button>
+              <button class="path-step" role="tab" aria-selected="false" data-step="write">
+                <strong>Write back safely</strong>
+                <span>remote success → refresh → persist</span>
+              </button>
+            </div>
+
+            <article class="inspector" aria-live="polite">
+              <div class="inspector-state" id="inspector-state">Canvas service instance</div>
+              <h3 id="inspector-title">The canvas opens the existing board.</h3>
+              <p id="inspector-copy">
+                The extension starts or reuses one loopback Taskboard service on
+                127.0.0.1. Every panel receives the same URL, data directory, and
+                realtime stream; closing a panel does not discard state.
+              </p>
+              <div class="proof" id="inspector-proof">Shared URL, persistence, and SSE verified</div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="shell">
+          <div class="section-heading">
+            <div class="section-kicker">Delivered scope</div>
+            <h2>Three adapters. One Taskboard vocabulary.</h2>
+          </div>
+
+          <div class="capabilities">
+            <article class="capability">
+              <div class="capability-code">HOST / COPILOT</div>
+              <h3>Session actions that wait for a real result.</h3>
+              <p>Create a coding session, jump to the active session, or open an HTTPS link. Host failures stay visible as failures.</p>
+            </article>
+            <article class="capability">
+              <div class="capability-code">SOURCE / PROVIDER</div>
+              <h3>Jira and ADO share the same seam.</h3>
+              <p>Discovery, stable identity, synchronization, status mapping, mutations, URLs, and errors live behind one provider contract.</p>
+            </article>
+            <article class="capability">
+              <div class="capability-code">AUTHORITY / ADO</div>
+              <h3>Remote state wins before the board changes.</h3>
+              <p>Status, assignee, and comments refresh from ADO after success. Rejected or indeterminate writes never look locally complete.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="install">
+        <div class="shell">
+          <div class="section-heading">
+            <div class="section-kicker">User-scoped install</div>
+            <h2>The overlay links to the durable checkout.</h2>
+          </div>
+          <div class="command">
+            <code>npm run copilot:install-canvas</code>
+            <span>Build → link → verify</span>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="shell">
+      <span>c00c/dashi-taskboard · issue 1</span>
+      <span>Implementation preview · no live credentials embedded</span>
+    </footer>
+
+    <script>
+      const stages = {
+        canvas: {
+          state: "Canvas service instance",
+          title: "The canvas opens the existing board.",
+          copy: "The extension starts or reuses one loopback Taskboard service on 127.0.0.1. Every panel receives the same URL, data directory, and realtime stream; closing a panel does not discard state.",
+          proof: "Shared URL, persistence, and SSE verified",
+        },
+        host: {
+          state: "Authenticated host bridge",
+          title: "Copilot actions complete before success appears.",
+          copy: "A per-process capability token protects the loopback bridge. The extension awaits the Copilot session result for session creation, navigation, and safe external links, so queued work cannot masquerade as completion.",
+          proof: "Unauthorized, unsupported, and SDK failures stay explicit",
+        },
+        sync: {
+          state: "External work provider",
+          title: "ADO work keeps its remote identity and local context.",
+          copy: "Configured repositories map to local workspaces. Selected work items arrive through Azure DevOps REST 7.1, require explicit lifecycle mapping, persist by stable origin and ID, and retain canonical links without duplicating unchanged tasks.",
+          proof: "Repository discovery and idempotent refresh verified",
+        },
+        write: {
+          state: "Authoritative write-back",
+          title: "The board updates only after ADO answers.",
+          copy: "Status, assignee, and comments use bounded provider capabilities. After ADO accepts a mutation, Taskboard refreshes the authoritative work item or comment before persisting and broadcasting the observable result.",
+          proof: "Auth, transition, network, and refresh failures preserve local state",
+        },
+      };
+
+      const buttons = [...document.querySelectorAll(".path-step")];
+      const state = document.querySelector("#inspector-state");
+      const title = document.querySelector("#inspector-title");
+      const copy = document.querySelector("#inspector-copy");
+      const proof = document.querySelector("#inspector-proof");
+
+      for (const button of buttons) {
+        button.addEventListener("click", () => {
+          const stage = stages[button.dataset.step];
+          for (const candidate of buttons) {
+            candidate.setAttribute("aria-selected", String(candidate === button));
+          }
+          state.textContent = stage.state;
+          title.textContent = stage.title;
+          copy.textContent = stage.copy;
+          proof.textContent = stage.proof;
+        });
+      }
+    </script>
+  </body>
+</html>
