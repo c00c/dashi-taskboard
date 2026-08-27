@@ -58,10 +58,12 @@ function adoUrl(config, projectId, pathname) {
 }
 
 function actorFromIdentity(identity, fallback) {
+  const descriptor = typeof identity?.descriptor === "string" ? identity.descriptor.trim() : "";
+  const descriptorId = descriptor ? `${ADO_DESCRIPTOR_ACTOR_PREFIX}${descriptor}` : "";
   const id = String(identity?.id ?? identity?.uniqueName ?? fallback).trim().slice(0, 240);
   return {
     type: "user",
-    id: `ado:${id || fallback}`,
+    id: descriptorId && descriptorId.length <= 240 ? descriptorId : `ado:${id || fallback}`,
     name: String(identity?.displayName ?? identity?.uniqueName ?? fallback).trim().slice(0, 120),
     avatarUrl: null,
   };

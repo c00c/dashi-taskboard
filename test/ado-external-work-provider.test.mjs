@@ -8,6 +8,19 @@ import { createTaskboardServer } from "../server/index.mjs";
 
 const runningApps = [];
 
+const ADO_IDENTITIES_BY_STORAGE_KEY = {
+  "33333333-3333-3333-3333-333333333333": {
+    descriptor: "aad.next-user",
+    displayName: "Next ADO User",
+    uniqueName: "next@example.test",
+  },
+  "44444444-4444-4444-4444-444444444444": {
+    descriptor: "aad.another-user",
+    displayName: "Another ADO User",
+    uniqueName: "another@example.test",
+  },
+};
+
 afterEach(async () => {
   while (runningApps.length > 0) {
     const { app, directory } = runningApps.pop();
@@ -145,8 +158,7 @@ function createAdoFixture() {
           if (operation.path === "/fields/System.AssignedTo" && operation.op === "add") {
             state.assignedTo = {
               ...operation.value,
-              displayName: "Next ADO User",
-              uniqueName: "next@example.test",
+              ...ADO_IDENTITIES_BY_STORAGE_KEY[operation.value?.id],
             };
           }
         }
@@ -466,7 +478,7 @@ test("ADO discovery and synchronization are observable through the public provid
     assert.equal(assigned.response.status, 200);
     assert.equal(
       assigned.body.task.assignee.id,
-      "ado:33333333-3333-3333-3333-333333333333",
+      "ado:descriptor:aad.next-user",
     );
 
     const rejectedRemoteField = await request(
@@ -593,6 +605,58 @@ test("ADO discovery and synchronization are observable through the public provid
     );
     assert.deepEqual(batch.body.ids, [42]);
     assert.equal(batch.body.ids.length <= 200, true);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ADO identifies one person the same way when read from a work item and when offered by discovery", async () => {
+  const ado = createAdoFixture();
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ado-identity-"));
+  const { baseUrl } = await startServer(ado.fetch);
+
+  try {
+    const task = await configureAndSync(baseUrl, {
+      projects: configuration(directory).projects,
+    });
+
+    const actors = await request(baseUrl, "/api/external-work/providers/ado/actors");
+    assert.equal(actors.response.status, 200);
+    const nextUser = actors.body.actors.find((actor) => actor.name === "Next ADO User");
+    assert.ok(nextUser);
+
+    const assigned = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
+      method: "PATCH",
+      body: { version: task.version, assignee: nextUser },
+    });
+    assert.equal(assigned.response.status, 200, JSON.stringify(assigned.body));
+    assert.equal(assigned.body.task.assignee.id, nextUser.id);
+
+    const pickerIds = new Set([
+      ...actors.body.actors.map((actor) => actor.id),
+      assigned.body.task.assignee.id,
+    ]);
+    assert.equal(pickerIds.size, actors.body.actors.length);
+
+    const patchesAfterAssignment = ado.state.requests.filter(
+      (entry) => entry.method === "PATCH",
+    ).length;
+    const reselected = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
+      method: "PATCH",
+      body: { version: assigned.body.task.version, assignee: nextUser },
+    });
+    assert.equal(reselected.response.status, 200, JSON.stringify(reselected.body));
+    assert.equal(reselected.body.task.assignee.id, nextUser.id);
+    assert.equal(
+      ado.state.requests.filter((entry) => entry.method === "PATCH").length,
+      patchesAfterAssignment,
+    );
+    assert.equal(
+      ado.state.requests.filter(
+        (entry) => entry.pathname.includes("/_apis/graph/storagekeys/"),
+      ).length,
+      1,
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
