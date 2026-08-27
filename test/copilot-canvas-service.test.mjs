@@ -16,7 +16,7 @@ afterEach(async () => {
   }
 });
 
-async function createService() {
+async function createService(options = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "taskboard-canvas-test-"));
   const dataDirectory = path.join(root, "data");
   const staticDirectory = path.join(root, "web");
@@ -28,13 +28,138 @@ async function createService() {
   temporaryDirectories.push(root);
 
   const taskboardOptions = { dataDirectory, staticDirectory };
-  const service = createTaskboardCanvasService({ taskboardOptions });
+  const service = createTaskboardCanvasService({ taskboardOptions, ...options });
   services.push(service);
   return { dataDirectory, service, taskboardOptions };
 }
 
+test("Copilot canvas creates a coding session with the task and workspace context", async () => {
+  const sent = [];
+  const { service } = await createService({
+    sessionSender: async (message) => sent.push(message),
+    sessionId: "active-copilot-session",
+  });
+  const opened = await service.open({ instanceId: "host-actions-panel" });
+
+  const result = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: {
+      action: "create-session",
+      task: {
+        identifier: "TASK-42",
+        title: "Add Copilot host actions",
+        instruction: "Implement the settled ticket.",
+        repository: "c00c/dashi-taskboard",
+        workspacePath: "C:\\work\\dashi-taskboard",
+      },
+    },
+  });
+
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.body, { ok: true });
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].prompt, /TASK-42/);
+  assert.match(sent[0].prompt, /Add Copilot host actions/);
+  assert.match(sent[0].prompt, /Implement the settled ticket\./);
+  assert.match(sent[0].prompt, /c00c\/dashi-taskboard/);
+  assert.match(sent[0].prompt, /C:\\work\\dashi-taskboard/);
+});
+
+test("Copilot canvas jumps back to its active app session", async () => {
+  const sent = [];
+  const { service } = await createService({
+    sessionSender: async (message) => sent.push(message),
+    sessionId: "active-copilot-session",
+  });
+  const opened = await service.open({ instanceId: "jump-panel" });
+
+  const result = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: { action: "jump-to-session" },
+  });
+
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.body, { ok: true });
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].prompt, /navigate_to/);
+  assert.match(sent[0].prompt, /active-copilot-session/);
+});
+
+test("Copilot canvas opens only HTTP and HTTPS external links through the host", async () => {
+  const sent = [];
+  const { service } = await createService({
+    sessionSender: async (message) => sent.push(message),
+  });
+  const opened = await service.open({ instanceId: "external-link-panel" });
+
+  const safe = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: { action: "open-external", url: "https://example.com/review?id=42" },
+  });
+  const unsafe = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: { action: "open-external", url: "javascript:alert(1)" },
+  });
+
+  assert.equal(safe.response.status, 200);
+  assert.deepEqual(safe.body, { ok: true });
+  assert.match(sent[0].prompt, /https:\/\/example\.com\/review\?id=42/);
+  assert.equal(unsafe.response.status, 400);
+  assert.equal(unsafe.body.error.code, "UNSAFE_EXTERNAL_URL");
+  assert.equal(sent.length, 1);
+});
+
+test("Copilot host failures are returned to the canvas instead of looking successful", async () => {
+  const { service } = await createService({
+    sessionSender: async () => {
+      throw new Error("Copilot session sender rejected the request");
+    },
+  });
+  const opened = await service.open({ instanceId: "failed-action-panel" });
+
+  const result = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: {
+      action: "create-session",
+      task: {
+        identifier: "TASK-43",
+        title: "Surface host failures",
+        instruction: "Do not return a success-shaped fallback.",
+        repository: "c00c/dashi-taskboard",
+        workspacePath: "C:\\work\\dashi-taskboard",
+      },
+    },
+  });
+
+  assert.equal(result.response.status, 502);
+  assert.deepEqual(result.body, {
+    error: {
+      code: "COPILOT_HOST_ACTION_FAILED",
+      message: "Copilot session sender rejected the request",
+    },
+  });
+});
+
+test("Copilot host actions reject requests without the canvas capability", async () => {
+  const { service } = await createService({
+    sessionSender: async () => assert.fail("unauthenticated requests must not reach Copilot"),
+  });
+  const opened = await service.open({ instanceId: "unauthenticated-panel" });
+
+  const response = await fetch(new URL("/api/copilot-host-actions", opened.url), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "open-external", url: "https://example.com" }),
+  });
+
+  assert.equal(response.status, 401);
+  assert.equal((await response.json()).error.code, "INVALID_COPILOT_HOST_TOKEN");
+});
+
 async function request(url, pathname, options = {}) {
   const headers = new Headers(options.headers);
+  const hostToken = new URL(url).searchParams.get("hostToken");
+  if (hostToken) headers.set("x-taskboard-copilot-token", hostToken);
   if (options.body !== undefined) headers.set("content-type", "application/json");
   const response = await fetch(new URL(pathname, url), {
     ...options,

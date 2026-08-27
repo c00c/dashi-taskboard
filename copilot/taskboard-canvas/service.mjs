@@ -1,16 +1,51 @@
-import { createTaskboardServer } from "../../server/index.mjs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 
-export function createTaskboardCanvasService({ taskboardOptions = {} } = {}) {
+import { createTaskboardServer } from "../../server/index.mjs";
+import { createCopilotHostActions } from "./host-actions.mjs";
+
+export function createTaskboardCanvasService({
+  taskboardOptions = {},
+  sessionSender = async () => {
+    throw new Error("Copilot session is unavailable");
+  },
+  sessionId,
+  workspacePath,
+} = {}) {
   const openPanels = new Set();
+  const hostToken = randomBytes(32).toString("hex");
+  const hostActions = createCopilotHostActions({ sessionSender, sessionId });
   let entry = null;
   let starting = null;
 
   async function start() {
-    const app = createTaskboardServer(taskboardOptions);
+    const app = createTaskboardServer({
+      ...taskboardOptions,
+      hostActionHandler: async (request, input) => {
+        const providedToken = request.headers["x-taskboard-copilot-token"];
+        const authenticated = typeof providedToken === "string"
+          && providedToken.length === hostToken.length
+          && timingSafeEqual(Buffer.from(providedToken), Buffer.from(hostToken));
+        if (!authenticated) {
+          return {
+            status: 401,
+            body: {
+              error: {
+                code: "INVALID_COPILOT_HOST_TOKEN",
+                message: "Copilot host authentication is required",
+              },
+            },
+          };
+        }
+        return hostActions(input);
+      },
+    });
     try {
       const address = await app.listen({ host: "127.0.0.1", port: 0 });
       const url = new URL(`http://127.0.0.1:${address.port}/`);
       url.searchParams.set("host", "copilot");
+      url.searchParams.set("hostToken", hostToken);
+      const activeWorkspacePath = typeof workspacePath === "function" ? workspacePath() : workspacePath;
+      if (activeWorkspacePath) url.searchParams.set("workspacePath", activeWorkspacePath);
       return { app, url: url.href };
     } catch (error) {
       await app.close();

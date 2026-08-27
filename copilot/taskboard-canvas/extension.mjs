@@ -2,7 +2,12 @@ import { createCanvas, joinSession } from "@github/copilot-sdk/extension";
 
 import { createTaskboardCanvasService } from "./service.mjs";
 
-const service = createTaskboardCanvasService();
+let sessionRef = null;
+const service = createTaskboardCanvasService({
+  sessionSender: (message) => sessionRef.sendAndWait(message, 120_000),
+  sessionId: process.env.SESSION_ID,
+  workspacePath: () => sessionRef?.workspacePath,
+});
 
 const canvas = createCanvas({
   id: "taskboard",
@@ -18,6 +23,7 @@ const canvas = createCanvas({
 });
 
 const session = await joinSession({ canvases: [canvas] });
+sessionRef = session;
 await session.log("Taskboard canvas extension ready.", { ephemeral: true });
 
 let shuttingDown = null;

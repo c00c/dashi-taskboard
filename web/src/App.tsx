@@ -20,6 +20,7 @@ import {
   createProject as createProjectRequest,
   createTask as createTaskRequest,
   configureJiraConnection,
+  createCopilotSession,
   deleteArchivedTask as deleteArchivedTaskRequest,
   deleteProjectLabel as deleteProjectLabelRequest,
   deleteProject as deleteProjectRequest,
@@ -29,12 +30,14 @@ import {
   getJiraConnection,
   getTaskboardRevision,
   getTaskboardMetadata,
+  jumpToCopilotSession,
   listArchivedTasks,
   listDevelopmentContexts,
   listDeviceWorkspaces,
   listProjects,
   listTasks,
   moveTask as moveTaskRequest,
+  openCopilotExternalLink,
   publishHostRuntime,
   removeTaskRelation,
   resolveTaskboardUrl,
@@ -372,7 +375,7 @@ function getInitialTheme(): Theme {
   const host = query.get("host");
   if (
     window.parent !== window
-    && (host === "codex" || host === "workbuddy" || host === "deepseek-harness")
+    && (host === "codex" || host === "workbuddy" || host === "deepseek-harness" || host === "copilot")
   ) {
     const fromQuery = query.get("theme");
     if (isTheme(fromQuery)) return fromQuery;
@@ -1655,6 +1658,25 @@ export function App() {
   }, [selectedProjectId, reconcileProjectAutomation]);
 
   useEffect(() => {
+    if (host !== "copilot") return;
+    function handleExternalLink(event: MouseEvent) {
+      const link = event.target instanceof Element
+        ? event.target.closest<HTMLAnchorElement>('a[target="_blank"]')
+        : null;
+      if (!link) return;
+      const rawHref = link.getAttribute("href");
+      if (!rawHref) return;
+      event.preventDefault();
+      void openCopilotExternalLink(rawHref).then(
+        () => setAnnouncement(textRef.current("链接已在 Copilot 中打开。", "Link opened in Copilot.")),
+        (error) => setActionError(errorMessage(error)),
+      );
+    }
+    document.addEventListener("click", handleExternalLink, true);
+    return () => document.removeEventListener("click", handleExternalLink, true);
+  }, [host]);
+
+  useEffect(() => {
     if (!embedded || window.parent === window) return;
     let acknowledgedFrameChallenge = "";
 
@@ -2814,6 +2836,13 @@ export function App() {
   }
 
   function openThread(binding: CodexThreadBinding) {
+    if (host === "copilot") {
+      void jumpToCopilotSession().then(
+        () => setAnnouncement(text("已切换到 Copilot 会话。", "Switched to the Copilot session.")),
+        (error) => setActionError(errorMessage(error)),
+      );
+      return;
+    }
     const remoteProject = binding.codexProjectKind === "remote"
       ? hostContext?.projects?.find((project) => (
           project.id === binding.codexProjectId
@@ -2848,6 +2877,13 @@ export function App() {
   }
 
   function openLegacyLocalThread(threadId: string) {
+    if (host === "copilot") {
+      void jumpToCopilotSession().then(
+        () => setAnnouncement(text("已切换到 Copilot 会话。", "Switched to the Copilot session.")),
+        (error) => setActionError(errorMessage(error)),
+      );
+      return;
+    }
     if (embedded && window.parent !== window) {
       postEmbeddedHostMessage({
         type: "taskboard:open-thread",
@@ -2910,6 +2946,44 @@ export function App() {
     const standalone = !embedded || window.parent === window;
     const projectless = task.projectId === GLOBAL_PROJECT_ID;
     const taskboardProject = projects.find((project) => project.id === task.projectId);
+    if (host === "copilot") {
+      const workspacePath = task.developmentContext?.type === "worktree"
+        ? task.developmentContext.path
+        : deviceWorkspacePaths[task.projectId]
+          ?? taskboardProject?.workspacePath
+          ?? query.get("workspacePath");
+      if (!workspacePath) {
+        setActionError(text(
+          "该议题缺少创建 Copilot 会话所需的工作区上下文。",
+          "This issue is missing the workspace context required to create a Copilot session.",
+        ));
+        return;
+      }
+      if (openingThreadTaskId) return;
+      setOpeningThreadTaskId(task.id);
+      setActionError(null);
+      try {
+        await createCopilotSession({
+          identifier: task.identifier,
+          title: task.title,
+          instruction: text(
+            `处理 Taskboard 议题 ${task.identifier}：${task.title}`,
+            `Work on Taskboard issue ${task.identifier}: ${task.title}`,
+          ),
+          repository: taskboardProject?.name ?? "Taskboard",
+          workspacePath,
+        });
+        setAnnouncement(text(
+          `已请求为 ${task.identifier} 创建 Copilot 会话。`,
+          `Requested a Copilot session for ${task.identifier}.`,
+        ));
+      } catch (error) {
+        setActionError(errorMessage(error));
+      } finally {
+        setOpeningThreadTaskId(null);
+      }
+      return;
+    }
     const savedRemoteIdentity = projectCodexIdentities[task.projectId]?.codexProjectKind === "remote"
       ? projectCodexIdentities[task.projectId]
       : null;

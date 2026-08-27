@@ -2052,6 +2052,14 @@ export function createTaskboardServer(options = {}) {
         : null;
       if (capabilityCloudConfig?.remoteUrl) assertLoopbackRequest(request);
 
+      if (pathname === "/api/copilot-host-actions" && options.hostActionHandler) {
+        assertNoQuery(url.searchParams, "Copilot host action routes");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertLoopbackRequest(request);
+        const result = await options.hostActionHandler(request, await readJson(request));
+        return sendJson(response, result.status, result.body);
+      }
+
       if (pathname === "/health") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         if (resolved.instanceToken) {

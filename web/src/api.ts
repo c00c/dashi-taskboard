@@ -143,6 +143,41 @@ export async function listProjects(signal?: AbortSignal): Promise<Project[]> {
   return data.projects;
 }
 
+type CopilotHostAction =
+  | { action: "open-external"; url: string }
+  | { action: "jump-to-session" }
+  | {
+      action: "create-session";
+      task: {
+        identifier: string;
+        title: string;
+        instruction: string;
+        repository: string;
+        workspacePath: string;
+      };
+    };
+
+async function sendCopilotHostAction(action: CopilotHostAction): Promise<void> {
+  const hostToken = new URL(document.baseURI).searchParams.get("hostToken");
+  await request<{ ok: true }>("/api/copilot-host-actions", {
+    method: "POST",
+    headers: hostToken ? { "X-Taskboard-Copilot-Token": hostToken } : undefined,
+    body: JSON.stringify(action),
+  });
+}
+
+export function openCopilotExternalLink(url: string): Promise<void> {
+  return sendCopilotHostAction({ action: "open-external", url });
+}
+
+export function jumpToCopilotSession(): Promise<void> {
+  return sendCopilotHostAction({ action: "jump-to-session" });
+}
+
+export function createCopilotSession(task: Extract<CopilotHostAction, { action: "create-session" }>["task"]): Promise<void> {
+  return sendCopilotHostAction({ action: "create-session", task });
+}
+
 export async function getJiraConnection(signal?: AbortSignal): Promise<JiraConnection> {
   try {
     const data = await request<{ connection: JiraConnection }>("/api/local/jira-connection", { signal });
