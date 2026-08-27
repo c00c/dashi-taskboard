@@ -341,7 +341,7 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
     return { id: String(match.id) };
   }
 
-  return {
+  const integration = {
     async status() {
       return safeConfig(await configStore.read(), lastSyncedAt);
     },
@@ -446,20 +446,62 @@ export function createJiraIntegration({ configStore, database, fetch: fetchImple
       }
       return false;
     },
-    async moveTask(task, status) {
-      if (status === task.status) return;
+  };
+  integration.provider = {
+    id: "jira",
+    displayName: "Jira",
+    supportedMutations: [
+      "status",
+      "title",
+      "description",
+      "priority",
+      "labels",
+      "dueDate",
+    ],
+    localOnlyMutations: ["developmentContext", "startDate", "recurrence"],
+    managesSynchronization: true,
+    getConnection: () => integration.status(),
+    configure: (configuration) => integration.configure(configuration),
+    async discoverProjects() {
       const config = await configStore.read();
-      if (!config) throw new ApiError(409, "JIRA_NOT_CONFIGURED", "Jira 尚未配置");
-      if (task.externalOrigin !== config.originId || !task.externalKey) {
+      if (!config) return [];
+      const project = database.getProject(JIRA_PROJECT_ID);
+      return [{
+        id: JIRA_PROJECT_ID,
+        name: project?.name ?? `Jira · ${config.displayName}`,
+        labels: project?.labels ?? [],
+        externalOrigin: config.originId ?? legacyJiraOriginId(config.baseUrl),
+        externalId: JIRA_PROJECT_ID,
+        externalUrl: config.baseUrl,
+      }];
+    },
+    async synchronize(options) {
+      if (options?.archiveMissing === false) await integration.reconcile();
+      else await integration.sync(options);
+      const project = database.getProject(JIRA_PROJECT_ID);
+      const [externalProject] = await integration.provider.discoverProjects();
+      return {
+        projects: project ? [{ ...project, ...externalProject, source: "jira" }] : [],
+        tasks: database.listTasks({
+          projectId: JIRA_PROJECT_ID,
+          archived: "false",
+        }),
+      };
+    },
+    mapStatus(status) {
+      return status;
+    },
+    async mutateTask({ identity, changes }) {
+      const task = database.getTaskByExternalIdentity("jira", identity.origin, identity.id);
+      if (!task) {
         throw new ApiError(
           409,
           "JIRA_ORIGIN_MISMATCH",
           "此任务不属于当前 Jira 连接，请重新同步后再操作",
         );
       }
-      await assertLiveOrigin(config);
-      const transition = await resolveTransition(config, task.externalKey, status);
-      await applyTransition(config, task.externalKey, transition);
+      return integration.updateTask(task, changes);
     },
   };
+  return integration;
 }

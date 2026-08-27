@@ -61,6 +61,18 @@ ln -s /absolute/path/to/codex-taskboard/skills/manage-taskboard \
 
 The desktop app keeps this same directory synchronized with its bundled Skill. The Skill teaches Codex to inspect an issue, move it to `in_progress`, use optimistic versions, verify the work, and then move it to `in_review`; it moves the issue to `done` only after the user explicitly confirms acceptance or asks to mark it complete.
 
+## Open Taskboard in GitHub Copilot
+
+Install the user-scoped canvas extension from this checkout:
+
+```bash
+npm run copilot:install-canvas
+```
+
+The command builds the existing web application, links the versioned extension into `~/.copilot/extensions/taskboard`, and verifies the installed adapter, upstream runtime assets, existing-data API, and close/reopen path. Keep the customization checkout at its installed location, reload Copilot extensions or start a new Copilot session, then open the **Taskboard** canvas from any project. Every panel reuses one loopback Taskboard service and the checkout's existing `.data` directory.
+
+See [Upgrading the Copilot canvas overlay](docs/copilot-canvas-upgrades.md) for the non-rewriting upstream merge and post-merge validation workflow.
+
 ## Embed in Codex
 
 ### Manual: use a dedicated CDP port

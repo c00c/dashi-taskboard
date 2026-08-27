@@ -260,8 +260,9 @@ function taskFromRow(row) {
     recurrence: row.recurrence_interval && row.recurrence_unit
       ? { interval: row.recurrence_interval, unit: row.recurrence_unit }
       : null,
-    source: row.external_source === "jira" ? "jira" : "local",
+    source: row.external_source ?? "local",
     externalOrigin: row.external_origin ?? null,
+    externalId: row.external_id ?? null,
     externalKey: row.external_key ?? null,
     externalUrl: row.external_url ?? null,
     archivedAt: row.archived_at,
@@ -347,7 +348,10 @@ function projectFromRow(row) {
     id: row.id,
     name: row.name,
     workspacePath: row.workspace_path,
-    source: row.id === JIRA_PROJECT_ID ? "jira" : "local",
+    source: row.external_source ?? (row.id === JIRA_PROJECT_ID ? "jira" : "local"),
+    externalOrigin: row.external_origin ?? null,
+    externalId: row.external_id ?? null,
+    externalUrl: row.external_url ?? null,
     labels: JSON.parse(row.labels),
     issueCount: Number(row.issue_count ?? 0),
     createdAt: row.created_at,
@@ -459,6 +463,10 @@ export class TaskboardDatabase {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         workspace_path TEXT,
+        external_source TEXT,
+        external_origin TEXT,
+        external_id TEXT,
+        external_url TEXT,
         labels TEXT NOT NULL DEFAULT '${DEFAULT_PROJECT_LABELS_JSON}',
         next_task_number INTEGER NOT NULL DEFAULT 1 CHECK (next_task_number > 0),
         created_at TEXT NOT NULL,
@@ -653,6 +661,16 @@ export class TaskboardDatabase {
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
     }
+    for (const column of ["external_source", "external_origin", "external_id", "external_url"]) {
+      if (!projectColumns.some((candidate) => candidate.name === column)) {
+        this.database.exec(`ALTER TABLE projects ADD COLUMN ${column} TEXT`);
+      }
+    }
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS projects_external_source_origin_id
+      ON projects(external_source, external_origin, external_id)
+      WHERE external_source IS NOT NULL AND external_origin IS NOT NULL AND external_id IS NOT NULL
+    `);
 
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
     const hasWorkflowId = taskColumns.some((column) => column.name === "workflow_id");
@@ -1073,6 +1091,10 @@ export class TaskboardDatabase {
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.external_source,
+        projects.external_origin,
+        projects.external_id,
+        projects.external_url,
         projects.labels,
         projects.created_at,
         projects.updated_at,
@@ -1085,6 +1107,10 @@ export class TaskboardDatabase {
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.external_source,
+        projects.external_origin,
+        projects.external_id,
+        projects.external_url,
         projects.labels,
         projects.created_at,
         projects.updated_at
@@ -1324,6 +1350,142 @@ export class TaskboardDatabase {
     }
   }
 
+  syncExternalWork(providerId, { projects, tasks }) {
+    const timestamp = now();
+    const seenTaskIds = new Set();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const upsertProject = this.database.prepare(`
+        INSERT INTO projects (
+          id, name, workspace_path, external_source, external_origin, external_id,
+          external_url, labels, next_task_number, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          name = excluded.name,
+          workspace_path = excluded.workspace_path,
+          external_source = excluded.external_source,
+          external_origin = excluded.external_origin,
+          external_id = excluded.external_id,
+          external_url = excluded.external_url,
+          labels = excluded.labels,
+          updated_at = excluded.updated_at
+      `);
+      for (const project of projects) {
+        upsertProject.run(
+          project.id,
+          project.name,
+          project.workspacePath ?? null,
+          providerId,
+          project.externalOrigin,
+          project.externalId,
+          project.externalUrl,
+          JSON.stringify(project.labels),
+          timestamp,
+          timestamp,
+        );
+      }
+
+      const findExisting = this.database.prepare(`
+        SELECT * FROM tasks
+        WHERE external_source = ? AND external_origin = ? AND external_id = ?
+      `);
+      const insertTask = this.database.prepare(`
+        INSERT INTO tasks (
+          id, identifier, project_id, title, description, status, priority, labels,
+          sort_order, creator_type, creator_id, creator_name, creator_avatar_url,
+          assignee_type, assignee_id, assignee_name, assignee_avatar_url,
+          due_date, external_source, external_origin, external_id, external_key,
+          external_url, archived_at, version, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?,
+          NULL, 1, ?, ?
+        )
+      `);
+      const updateTask = this.database.prepare(`
+        UPDATE tasks SET
+          identifier = ?, project_id = ?, title = ?, description = ?, status = ?,
+          priority = ?, labels = ?, sort_order = ?,
+          creator_type = ?, creator_id = ?, creator_name = ?, creator_avatar_url = ?,
+          assignee_type = ?, assignee_id = ?, assignee_name = ?, assignee_avatar_url = ?,
+          due_date = ?, external_key = ?, external_url = ?, archived_at = NULL,
+          version = version + 1, updated_at = ?
+        WHERE id = ?
+      `);
+      for (const task of tasks) {
+        const existing = findExisting.get(providerId, task.externalOrigin, task.externalId);
+        const taskId = existing?.id ?? task.id;
+        seenTaskIds.add(taskId);
+        const labels = JSON.stringify(task.labels);
+        if (!existing) {
+          insertTask.run(
+            task.id, task.identifier, task.projectId, task.title, task.description,
+            task.status, task.priority, labels, task.sortOrder,
+            task.creator.type, task.creator.id, task.creator.name, task.creator.avatarUrl,
+            task.assignee.type, task.assignee.id, task.assignee.name, task.assignee.avatarUrl,
+            task.dueDate, providerId, task.externalOrigin, task.externalId, task.externalKey,
+            task.externalUrl, task.createdAt, task.updatedAt,
+          );
+          continue;
+        }
+        const changed = existing.identifier !== task.identifier
+          || existing.project_id !== task.projectId
+          || existing.title !== task.title
+          || existing.description !== task.description
+          || existing.status !== task.status
+          || existing.priority !== task.priority
+          || existing.labels !== labels
+          || existing.sort_order !== task.sortOrder
+          || existing.creator_type !== task.creator.type
+          || existing.creator_id !== task.creator.id
+          || existing.creator_name !== task.creator.name
+          || existing.creator_avatar_url !== task.creator.avatarUrl
+          || existing.assignee_type !== task.assignee.type
+          || existing.assignee_id !== task.assignee.id
+          || existing.assignee_name !== task.assignee.name
+          || existing.assignee_avatar_url !== task.assignee.avatarUrl
+          || existing.due_date !== task.dueDate
+          || existing.external_key !== task.externalKey
+          || existing.external_url !== task.externalUrl
+          || existing.archived_at !== null;
+        if (!changed) continue;
+        updateTask.run(
+          task.identifier, task.projectId, task.title, task.description, task.status,
+          task.priority, labels, task.sortOrder,
+          task.creator.type, task.creator.id, task.creator.name, task.creator.avatarUrl,
+          task.assignee.type, task.assignee.id, task.assignee.name, task.assignee.avatarUrl,
+          task.dueDate, task.externalKey, task.externalUrl, task.updatedAt, existing.id,
+        );
+      }
+      const currentTasks = this.database.prepare(`
+        SELECT id FROM tasks
+        WHERE external_source = ? AND project_id IN (
+          SELECT id FROM projects WHERE external_source = ?
+        ) AND archived_at IS NULL
+      `).all(providerId, providerId);
+      const archiveTask = this.database.prepare(`
+        UPDATE tasks SET archived_at = ?, version = version + 1, updated_at = ? WHERE id = ?
+      `);
+      for (const task of currentTasks) {
+        if (!seenTaskIds.has(task.id)) archiveTask.run(timestamp, timestamp, task.id);
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getTaskByExternalIdentity(providerId, externalOrigin, externalId) {
+    const row = this.database.prepare(`
+      SELECT * FROM tasks
+      WHERE external_source = ? AND external_origin = ? AND external_id = ?
+    `).get(providerId, externalOrigin, externalId);
+    if (!row) return null;
+    return this.getTask(row.id);
+  }
+
   deleteProject(id) {
     const project = this.getProject(id);
     if (!project) {
@@ -1352,6 +1514,10 @@ export class TaskboardDatabase {
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.external_source,
+        projects.external_origin,
+        projects.external_id,
+        projects.external_url,
         projects.labels,
         projects.created_at,
         projects.updated_at,
@@ -1365,6 +1531,10 @@ export class TaskboardDatabase {
         projects.id,
         projects.name,
         projects.workspace_path,
+        projects.external_source,
+        projects.external_origin,
+        projects.external_id,
+        projects.external_url,
         projects.labels,
         projects.created_at,
         projects.updated_at
@@ -2528,8 +2698,8 @@ export class TaskboardDatabase {
   }
 
   createComment(taskId, input) {
-    const id = randomUUID();
-    const timestamp = now();
+    const id = input.id ?? randomUUID();
+    const timestamp = input.createdAt ?? now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(taskId);

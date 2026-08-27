@@ -12,7 +12,7 @@ export const TASK_PRIORITIES = ["none", "urgent", "high", "medium", "low"] as co
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 export type TaskPriority = (typeof TASK_PRIORITIES)[number];
 export type ActorType = "user" | "agent";
-export type AssigneeTarget = "current-user" | "codex-agent";
+export type AssigneeTarget = "current-user" | "codex-agent" | "unassigned";
 export type IssueRelationType = "parent" | "blocks" | "blocked_by" | "related";
 export type IssueRelationOrigin = "manual" | "mention";
 
@@ -333,7 +333,7 @@ export interface Project {
   id: string;
   name: string;
   workspacePath: string | null;
-  source: "local" | "jira";
+  source: "local" | "jira" | "ado";
   labels: string[];
   issueCount: number;
   createdAt: string;
@@ -425,7 +425,7 @@ export interface Task {
   startDate: string | null;
   dueDate: string | null;
   recurrence: Recurrence | null;
-  source: "local" | "jira";
+  source: string;
   externalOrigin?: string | null;
   externalKey?: string | null;
   externalUrl: string | null;
@@ -445,6 +445,54 @@ export interface JiraConnection {
   projectId: string;
   lastSyncedAt: string | null;
   insecureHttp: boolean;
+}
+
+export interface AdoRepositoryMapping {
+  id: string;
+  workspacePath: string;
+  workItemIds: number[];
+}
+
+export interface AdoProjectConfiguration {
+  id: string;
+  name: string;
+  repositories: AdoRepositoryMapping[];
+}
+
+export interface AdoDiscoveryInput {
+  organization: string;
+  personalAccessToken: string;
+  projects: Array<{ id: string; name: string }>;
+}
+
+export interface AdoConfigurationInput extends AdoDiscoveryInput {
+  projects: AdoProjectConfiguration[];
+  stateMapping: Record<string, TaskStatus>;
+}
+
+export interface AdoConnection {
+  configured: boolean;
+  organization: string | null;
+  projects: AdoProjectConfiguration[];
+  stateMapping: Record<string, TaskStatus>;
+}
+
+export interface AdoDiscoveredProject {
+  id: string;
+  name: string;
+  labels: string[];
+  workspacePath: string | null;
+  repository: {
+    id: string;
+    name: string;
+    configuredProjectId: string;
+    projectId: string;
+    projectName: string;
+  };
+  externalOrigin: string;
+  externalId: string;
+  externalUrl: string;
+  source: "ado";
 }
 
 export interface Comment {
@@ -521,6 +569,7 @@ export interface TaskDraft {
   status: TaskStatus;
   priority: TaskPriority;
   labels: string[];
+  assignee?: ActorIdentity;
   assigneeTarget?: AssigneeTarget;
   developmentContext: DevelopmentContext | null;
   startDate: string | null;

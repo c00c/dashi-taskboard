@@ -61,6 +61,18 @@ ln -s /absolute/path/to/codex-taskboard/skills/manage-taskboard \
 
 桌面 App 会让该目录与内置 Skill 保持同步。该 Skill 会指导 Codex 检查议题，将其移到 `in_progress`，使用乐观版本控制，验证工作，然后将其移到 `in_review`；只有在用户明确确认接受或要求将议题标记为完成后，才会将议题移到 `done`。
 
+## 在 GitHub Copilot 中打开 Taskboard
+
+从当前检出目录安装用户级 Canvas 扩展：
+
+```bash
+npm run copilot:install-canvas
+```
+
+该命令会构建现有 Web 应用，将版本化扩展链接到 `~/.copilot/extensions/taskboard`，并验证已安装的适配器、上游运行时资源、现有数据 API 以及关闭后重新打开的路径。请将定制检出目录保留在安装时的位置，重新加载 Copilot 扩展或启动新的 Copilot 会话，然后从任意项目打开 **Taskboard** Canvas。所有面板会复用同一个回环 Taskboard 服务和该检出目录中的现有 `.data` 目录。
+
+有关不重写历史的上游合并和合并后验证流程，请参阅[升级 Copilot Canvas overlay](docs/copilot-canvas-upgrades.md)。
+
 ## 嵌入 Codex
 
 ### 手动：使用专用 CDP 端口

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { DragEvent } from "react";
 import type { ActorIdentity, Task, TaskDraft, TaskStatus } from "../types";
+import type { ExternalWorkProviderDescription } from "../api";
 import { taskStatusLabel, useTaskboardI18n } from "../i18n";
 import type { TaskCardPresentation, TaskConversationItem } from "../taskConversations";
 import { TaskCard } from "./TaskCard";
@@ -33,6 +34,7 @@ interface BoardColumnProps {
   settlingTaskId: string | null;
   contextMenuTaskId: string | null;
   availableLabels: string[];
+  externalProviders: ExternalWorkProviderDescription[];
   projectNames?: Record<string, string>;
   currentUser: ActorIdentity;
   showCover: boolean;
@@ -65,6 +67,7 @@ export function BoardColumn({
   settlingTaskId,
   contextMenuTaskId,
   availableLabels,
+  externalProviders,
   projectNames,
   currentUser,
   showCover,
@@ -184,6 +187,7 @@ export function BoardColumn({
               isSettling={settlingTaskId === task.id}
               isContextMenuOpen={contextMenuTaskId === task.id}
               availableLabels={availableLabels}
+              externalProviders={externalProviders}
               projectName={projectNames?.[task.projectId]}
               currentUser={currentUser}
               showCover={showCover}

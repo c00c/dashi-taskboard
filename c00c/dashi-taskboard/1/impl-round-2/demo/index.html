@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Taskboard Canvas Overlay — Build 1, Round 2 Convergence</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #152033;
+        --paper: #f4f7fb;
+        --panel: #ffffff;
+        --cobalt: #3157e3;
+        --teal: #0b8f83;
+        --signal: #f2b84b;
+        --alarm: #c4453c;
+        --muted: #667085;
+        --line: #cbd4e1;
+        --shadow: 0 20px 60px rgba(28, 48, 86, 0.12);
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background:
+          linear-gradient(rgba(49, 87, 227, 0.045) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(49, 87, 227, 0.045) 1px, transparent 1px),
+          var(--paper);
+        background-size: 28px 28px;
+        font-family: "Segoe UI", "Aptos", sans-serif;
+        line-height: 1.55;
+      }
+
+      .shell { width: min(1120px, calc(100% - 40px)); margin: 0 auto; }
+
+      .utility {
+        display: flex;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 12px;
+        padding: 22px 0;
+        color: var(--muted);
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 12px;
+        letter-spacing: 0.04em;
+      }
+
+      header.masthead {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 34px 38px;
+        box-shadow: var(--shadow);
+      }
+
+      .eyebrow {
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        color: var(--cobalt);
+        margin: 0 0 10px;
+      }
+
+      h1 { margin: 0 0 12px; font-size: 34px; line-height: 1.2; }
+
+      .lede { margin: 0; max-width: 68ch; color: #35435c; font-size: 17px; }
+
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 14px;
+        margin: 26px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .stats li {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px 16px;
+        background: #fbfcfe;
+      }
+
+      .stats .n {
+        display: block;
+        font-size: 26px;
+        font-weight: 650;
+        font-family: "Cascadia Mono", "Consolas", monospace;
+      }
+
+      .stats .k {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--muted);
+      }
+
+      section {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 28px 34px;
+        margin: 22px 0;
+        box-shadow: var(--shadow);
+      }
+
+      h2 { margin: 0 0 6px; font-size: 22px; }
+
+      .section-note { margin: 0 0 20px; color: var(--muted); max-width: 74ch; }
+
+      table { width: 100%; border-collapse: collapse; font-size: 14px; }
+
+      caption { text-align: left; color: var(--muted); padding-bottom: 10px; font-size: 13px; }
+
+      th, td { text-align: left; padding: 11px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+
+      th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+
+      tbody tr:last-child td { border-bottom: 0; }
+
+      code {
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 0.92em;
+        background: #eef2f9;
+        border-radius: 4px;
+        padding: 1px 5px;
+      }
+
+      .tag {
+        display: inline-block;
+        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        border-radius: 999px;
+        padding: 3px 10px;
+        border: 1px solid currentColor;
+        white-space: nowrap;
+      }
+
+      .p-high { color: var(--alarm); }
+      .p-medium { color: #9a6b12; }
+      .p-low { color: var(--muted); }
+      .s-fixed { color: var(--teal); }
+      .s-deferred { color: var(--muted); }
+
+      .lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+
+      .lane { border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; background: #fbfcfe; }
+
+      .lane h3 { margin: 0 0 4px; font-size: 15px; }
+
+      .lane p { margin: 0 0 10px; font-size: 13px; color: var(--muted); }
+
+      .lane code { font-size: 12px; }
+
+      .checks { list-style: none; margin: 0; padding: 0; }
+
+      .checks li {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 10px 0;
+        border-bottom: 1px solid var(--line);
+        font-size: 14px;
+      }
+
+      .checks li:last-child { border-bottom: 0; }
+
+      .checks .r { font-family: "Cascadia Mono", "Consolas", monospace; color: var(--teal); white-space: nowrap; }
+
+      .callout {
+        border-left: 3px solid var(--signal);
+        background: #fffaf0;
+        padding: 14px 18px;
+        border-radius: 0 10px 10px 0;
+        margin: 16px 0 0;
+        font-size: 14px;
+      }
+
+      footer { padding: 8px 0 40px; color: var(--muted); font-size: 13px; }
+
+      @media (max-width: 640px) {
+        header.masthead, section { padding: 22px 20px; }
+        h1 { font-size: 27px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="utility">
+        <span>c00c/dashi-taskboard &middot; issue #1 &middot; build 1</span>
+        <span>opId iss1/converging/r2-p2 &middot; round 2 &middot; passes 1&ndash;2</span>
+      </div>
+
+      <header class="masthead">
+        <p class="eyebrow">Implement &mdash; convergence passes 1 and 2</p>
+        <h1>Twelve findings over two passes, ten fixed</h1>
+        <p class="lede">
+          Each pass ran two independent reviews in parallel &mdash; the primary reviewer and the
+          mandated secondary model (GPT&#8209;5.3&#8209;Codex) &mdash; and every finding was
+          reproduced against the real source before any code moved. Pass&nbsp;2 earned its keep:
+          it caught three defects that were the <em>same</em> defects pass&nbsp;1 had fixed, left
+          applied to only two of their three sites.
+        </p>
+        <ul class="stats">
+          <li><span class="n">12</span><span class="k">findings triaged</span></li>
+          <li><span class="n">10</span><span class="k">fixed</span></li>
+          <li><span class="n">2</span><span class="k">deferred with cause</span></li>
+          <li><span class="n">0</span><span class="k">new test failures</span></li>
+        </ul>
+      </header>
+
+      <section>
+        <h2>Pass 1 &mdash; prioritised findings</h2>
+        <p class="section-note">
+          Ordered by priority. Every entry was reproduced against the real source before it was
+          accepted &mdash; a reviewer claim on its own was not treated as a finding.
+        </p>
+        <table>
+          <caption>Origin: P = primary review, S = secondary review (GPT&#8209;5.3&#8209;Codex), O = orchestrator baseline.</caption>
+          <thead>
+            <tr>
+              <th scope="col">Priority</th>
+              <th scope="col">Finding</th>
+              <th scope="col">Origin</th>
+              <th scope="col">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="tag p-high">high</span></td>
+              <td>
+                <strong><code>node --test</code> collected a vitest file, breaking CI.</strong>
+                On Node&nbsp;22.18+ type stripping is on by default, so the default glob matched
+                <code>web/src/copilotExternalLinks.test.ts</code> and failed with
+                <code>ERR_MODULE_NOT_FOUND</code>. Renamed to <code>.tsx</code>, matching the two
+                existing vitest tests, which the glob never matches.
+              </td>
+              <td>O</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-high">high</span></td>
+              <td>
+                <strong>Authoritative external move discarded the local thread binding.</strong>
+                The early return handed back the provider&rsquo;s refreshed task and exited, so
+                <code>threadId</code> / <code>threadBinding</code> were dropped behind a
+                <code>200</code>. The shipped CLI always sends them.
+              </td>
+              <td>P</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-high">high</span></td>
+              <td>
+                <strong>Cloud mode hides externally synced work.</strong> Reads are forwarded to
+                cloud while external sync writes locally, so synced items are invisible.
+              </td>
+              <td>S</td>
+              <td><span class="tag s-deferred">deferred</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>Same drop on the authoritative PATCH path.</strong> With only remote-owned
+                fields in the patch, <code>localChanges</code> was empty and the thread fields were
+                discarded &mdash; asymmetric with the branch directly below it.
+              </td>
+              <td>P</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>Operator precedence disabled assignee de-duplication.</strong> Member
+                access binds tighter than <code>?:</code>, so <code>.filter</code> applied only to
+                the local branch. An unassigned ADO item rendered two identical options sharing a
+                React key.
+              </td>
+              <td>P</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>ADO named one person two ways.</strong> Work-item reads emitted
+                <code>ado:&lt;guid&gt;</code> while discovery emitted
+                <code>ado:descriptor:&hellip;</code>, so the same human could never compare equal
+                &mdash; duplicated in the picker, and re-selecting them burned a no-op remote write.
+              </td>
+              <td>P</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>The bounded write set was not enforced in the UI.</strong> Ticket&nbsp;07
+                requires enforcement by provider, server API <em>and</em> UI. The server enforced it;
+                the UI used hard-coded provider-name checks and let unsupported fields be edited
+                into a predictable <code>409</code>.
+              </td>
+              <td>S</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>Synced comments never converged.</strong> The insert-only skip kept re-sync
+                idempotent but left a remotely edited body permanently stale. Now an upsert on the
+                stable external id: insert if missing, update only when the body changed, otherwise
+                a genuine no-op.
+              </td>
+              <td>S</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-low">low</span></td>
+              <td>
+                <strong>Harness demo page committed into the product repo.</strong> Unreferenced by
+                any build script and unrelated to the seven tickets.
+              </td>
+              <td>P</td>
+              <td><span class="tag s-deferred">deferred</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Why the two deferrals are deferrals</h2>
+        <p class="section-note">
+          Both were accepted as real. Neither was fixed, and the reason is recorded rather than
+          left implicit.
+        </p>
+        <div class="lanes">
+          <div class="lane">
+            <h3>Cloud mode hides synced work</h3>
+            <p>
+              The cloud worker contains no external-work references at all, and the cloud D1
+              migrations define no <code>external_origin</code> / <code>external_id</code> columns
+              &mdash; the local schema does. Cloud has never been able to <em>store</em> external
+              work identity, so this is a pre-existing structural gap that the branch made quiet
+              rather than a capability it removed. Closing it needs new cloud migrations and worker
+              routes; the settled spec puts cloud-hosted deployment out of scope. Carried as a known
+              limitation.
+            </p>
+          </div>
+          <div class="lane">
+            <h3>Harness demo page in the repo</h3>
+            <p>
+              The reviewer is right on principle. The Agent Loop work order mandates this exact
+              code-stamped path for the round&rsquo;s preview, so removing it would break the stage
+              contract. Raised for the harness, not actionable inside this change.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Fix lanes</h2>
+        <p class="section-note">
+          Split by conflict domain, not by finding count, so no two workers touched the same file.
+          Workers wrote only in their own worktree; integration onto the canonical branch happened
+          once, here.
+        </p>
+        <div class="lanes">
+          <div class="lane">
+            <h3>Server fidelity</h3>
+            <p>Thread bindings on both authoritative paths, plus comment convergence.</p>
+            <p><code>server/app.mjs</code>, <code>server/external-work-providers.mjs</code></p>
+            <p>106 / 106 tests, accepted-comment recovery still a single remote POST.</p>
+          </div>
+          <div class="lane">
+            <h3>ADO identity</h3>
+            <p>
+              One stable id per person. Unified on the descriptor form, because
+              <code>System.AssignedTo.id</code> is the storage-key GUID rather than the Graph
+              <code>originId</code> &mdash; emitting GUIDs from discovery would have reintroduced the
+              per-user lookup already rejected.
+            </p>
+            <p><code>server/ado-integration.mjs</code></p>
+            <p>Pagination untouched; discovery still makes zero storage-key calls.</p>
+          </div>
+          <div class="lane">
+            <h3>Web write set</h3>
+            <p>
+              Editability now derives from the provider&rsquo;s declared
+              <code>supportedMutations</code> / <code>localOnlyMutations</code> instead of
+              hard-coded provider names &mdash; the provider-neutral seam ticket&nbsp;04 asked for.
+            </p>
+            <p><code>web/src/externalWriteSet.ts</code>, <code>web/src/components/TaskDetail.tsx</code></p>
+            <p>Unknown capabilities stay editable; the server remains the backstop.</p>
+          </div>
+        </div>
+        <p class="callout">
+          One guard was deliberately kept: deleting a label removes a definition from the workspace
+          catalogue rather than mutating a task field, and <code>describe()</code> exposes no
+          capability that can express catalogue ownership. Replacing it would have been a guess.
+        </p>
+      </section>
+
+      <section>
+        <h2>Pass 2 &mdash; the fixes that were only half-applied</h2>
+        <p class="section-note">
+          Both reviews ran again against the integrated pass&nbsp;1 branch. Three findings came
+          back, all verified against source, all fixed. Two of the three were pass&nbsp;1&rsquo;s
+          own corrections applied to <code>TaskDetail.tsx</code> and <code>TaskEditor.tsx</code>
+          but never to the third site, <code>TaskCard.tsx</code> &mdash; which is the case for
+          running a second pass rather than trusting the first.
+        </p>
+        <table>
+          <caption>Origin: P = primary review, S = secondary review (GPT&#8209;5.3&#8209;Codex).</caption>
+          <thead>
+            <tr>
+              <th scope="col">Priority</th>
+              <th scope="col">Finding</th>
+              <th scope="col">Origin</th>
+              <th scope="col">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>Board-card quick edits bypassed the provider write set.</strong>
+                <code>TaskCard</code> rendered priority, label and due-date controls with no
+                capability check at all, so an Azure&nbsp;DevOps card dispatched mutations the
+                server rejects with&nbsp;409. Its assignee gate was still the hard-coded
+                <code>source === "jira"</code> string. All four gates now derive from
+                <code>canMutateTaskField</code>.
+              </td>
+              <td>S</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>The assignee dedupe never ran on the external branch.</strong>
+                Member access binds tighter than <code>?:</code>, so
+                <code>.filter(dedupe)</code> applied only to the local branch of the ternary. An
+                unassigned ADO item made <code>task.assignee</code> byte-identical to
+                <code>UNASSIGNED_ACTOR</code>, producing a duplicated option and a duplicate React
+                key. Parenthesised, matching the two sibling files.
+              </td>
+              <td>P</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+            <tr>
+              <td><span class="tag p-medium">medium</span></td>
+              <td>
+                <strong>The write set went stale across a source change.</strong>
+                <code>TaskDetail</code>&rsquo;s effect was keyed on <code>[task.source]</code> but
+                never cleared the previous provider&rsquo;s capabilities, so a task could be judged
+                against the prior provider until the fetch landed. Fixed by deletion: the effect
+                and its state are gone and the write set is derived at render time.
+              </td>
+              <td>S</td>
+              <td><span class="tag s-fixed">fixed</span></td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="callout">
+          The hard-coded <code>=== "jira"</code> assignee guard had been returning the right answer
+          <em>by coincidence</em>. Jira declares priority, labels and due date but not assignee;
+          Azure&nbsp;DevOps declares assignee but none of the other three. The two providers are
+          near-inverses, so a guard naming one of them happened to be correct for that one and
+          silently wrong for the other. Deriving from declared capabilities makes both correct by
+          construction &mdash; which is what ticket&nbsp;04&rsquo;s provider-neutral seam asked for.
+        </p>
+      </section>
+
+      <section>
+        <h2>How pass 2 sourced the capability list</h2>
+        <p class="section-note">
+          <code>TaskCard</code> renders once per card, so the obvious fix &mdash; fetch the provider
+          list inside the card &mdash; would have cost one HTTP request per card on the board.
+        </p>
+        <div class="lanes">
+          <div class="lane">
+            <h3>One fetch, existing path</h3>
+            <p>
+              The list is fetched once in <code>App</code> and drilled through
+              <code>BoardColumn</code> and <code>OtherTasksPanel</code> along the exact prop path
+              <code>availableLabels</code> already uses. No new cache, no new mechanism.
+            </p>
+            <p><code>web/src/App.tsx</code> &plus;15 lines</p>
+          </div>
+          <div class="lane">
+            <h3>Derived, not stored</h3>
+            <p>
+              Each card computes its own write set from its own <code>task.source</code> at render
+              time. A card can no longer be judged against another provider&rsquo;s rules, because
+              nothing is held in state to go stale.
+            </p>
+            <p><code>web/src/components/TaskDetail.tsx</code> &minus;15 lines</p>
+          </div>
+          <div class="lane">
+            <h3>Unknown stays editable</h3>
+            <p>
+              Before the fetch resolves &mdash; or if it fails &mdash; the list is empty, the write
+              set is <code>null</code>, and every field stays editable with the server&rsquo;s 409
+              as the backstop. A transient failure cannot lock the board.
+            </p>
+            <p><code>web/src/externalWriteSet.ts</code> unchanged</p>
+          </div>
+        </div>
+        <p class="callout">
+          Reported rather than hidden: the staleness in finding&nbsp;3 is real at the component
+          level but hard to reach in the running app, because <code>TaskDetail</code> is rendered
+          with <code>key={detailTask.id}</code> and remounts when the task changes. It was still
+          fixed &mdash; the fix is a net deletion, and it removes the trap if that key is ever
+          dropped.
+        </p>
+      </section>
+
+      <section>
+        <h2>Validation on the integrated branch</h2>
+        <p class="section-note">
+          Re-run in full on the canonical branch after pass&nbsp;2 was integrated &mdash; not
+          inherited from the fix worker&rsquo;s worktree. The single remaining failure is
+          documented and also fails on <code>main</code>.
+        </p>
+        <ul class="checks">
+          <li><span><code>node --test</code> (CI shape, type stripping on)</span><span class="r">401 tests &middot; 398 pass &middot; 1 pre-existing fail</span></li>
+          <li><span><code>npm run test:components</code></span><span class="r">5 files &middot; 29 pass</span></li>
+          <li><span><code>npm run typecheck</code></span><span class="r">pass</span></li>
+          <li><span><code>npm run build</code> (full, incl. injector)</span><span class="r">pass</span></li>
+          <li><span><code>npm run copilot:verify-canvas</code></span><span class="r">42 / 42 pass</span></li>
+        </ul>
+        <p class="callout">
+          Two gaps closed since pass&nbsp;1. The component suite reads a hard-coded file list, so a
+          new test file does not run until it is registered &mdash; the count moving 23&nbsp;&rarr;&nbsp;29
+          is the evidence the new cases execute. And the build gate now runs the full
+          <code>npm&nbsp;run&nbsp;build</code> that CI runs, not just <code>build:web</code>.
+        </p>
+      </section>
+
+      <footer class="shell">
+        Convergence pass 2 of a maximum 10. Every finding raised across both passes is either
+        fixed or deferred with a recorded cause; nothing was left half-applied.
+      </footer>
+    </div>
+  </body>
+</html>

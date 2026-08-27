@@ -9,10 +9,11 @@ async function source(pathname) {
 }
 
 test("issue model and editor preserve a concrete assignee identity", async () => {
-  const [typesSource, appSource, editorSource] = await Promise.all([
+  const [typesSource, appSource, editorSource, detailSource] = await Promise.all([
     source("web/src/types.ts"),
     source("web/src/App.tsx"),
     source("web/src/components/TaskEditor.tsx"),
+    source("web/src/components/TaskDetail.tsx"),
   ]);
 
   assert.match(typesSource, /export type AssigneeTarget = "current-user" \| "codex-agent"/);
@@ -22,6 +23,9 @@ test("issue model and editor preserve a concrete assignee identity", async () =>
   assert.match(editorSource, /currentUser: ActorIdentity/);
   assert.match(editorSource, /ariaLabel=\{text\("负责人", "Assignee"\)\}/);
   assert.match(editorSource, /CODEX_AGENT_ACTOR/);
+  assert.match(detailSource, /listExternalWorkActors\(task\.source/);
+  assert.match(detailSource, /saveTask\(\{ assignee: selected \}, "assignee"\)/);
+  assert.match(typesSource, /assignee\?: ActorIdentity/);
 });
 
 test("issue detail and cards expose the same assignee identity", async () => {

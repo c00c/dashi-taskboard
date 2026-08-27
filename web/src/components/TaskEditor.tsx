@@ -21,6 +21,7 @@ import {
 } from "../types";
 import {
   CODEX_AGENT_ACTOR,
+  UNASSIGNED_ACTOR,
   actorKey,
   assigneeTargetForActor,
 } from "../actors";
@@ -272,7 +273,9 @@ export function TaskEditor({
         : subIssueIds,
   );
 
-  const assigneeOptions = [task?.assignee, currentUser, CODEX_AGENT_ACTOR]
+  const assigneeOptions = (task && task.source !== "local" && task.source !== "jira"
+    ? [task.assignee, UNASSIGNED_ACTOR]
+    : [task?.assignee, currentUser, CODEX_AGENT_ACTOR])
     .filter((actor): actor is ActorIdentity => actor !== undefined)
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index

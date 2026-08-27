@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { CSSProperties, DragEvent } from "react";
 import type { ActorIdentity, Task, TaskDraft, TaskStatus } from "../types";
+import type { ExternalWorkProviderDescription } from "../api";
 import type { TaskCardPresentation, TaskConversationItem } from "../taskConversations";
 import { taskStatusLabel, useTaskboardI18n } from "../i18n";
 import type { OtherTaskTab } from "../issueBoardStatuses";
@@ -145,6 +146,7 @@ interface OtherTasksPanelProps {
   settlingTaskId: string | null;
   contextMenuTaskId: string | null;
   availableLabels: string[];
+  externalProviders: ExternalWorkProviderDescription[];
   projectNames?: Record<string, string>;
   currentUser: ActorIdentity;
   showCover: boolean;
@@ -182,6 +184,7 @@ export function OtherTasksPanel({
   settlingTaskId,
   contextMenuTaskId,
   availableLabels,
+  externalProviders,
   projectNames,
   currentUser,
   showCover,
@@ -349,6 +352,7 @@ export function OtherTasksPanel({
               isSettling={settlingTaskId === task.id}
               isContextMenuOpen={contextMenuTaskId === task.id}
               availableLabels={availableLabels}
+              externalProviders={externalProviders}
               projectName={projectNames?.[task.projectId]}
               currentUser={currentUser}
               showCover={showCover}

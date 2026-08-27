@@ -14,6 +14,7 @@ interface LabelPickerProps {
   showIcon?: boolean;
   showSelectedAsChips?: boolean;
   placeholder?: string;
+  title?: string;
   triggerContent?: ReactNode;
   onOpenChange: (open: boolean) => void;
   onChange: (labels: string[]) => void;
@@ -31,6 +32,7 @@ export function LabelPicker({
   showIcon = false,
   showSelectedAsChips = false,
   placeholder,
+  title,
   triggerContent,
   onOpenChange,
   onChange,
@@ -122,6 +124,7 @@ export function LabelPicker({
         aria-label={text("选择或创建标签", "Select or create labels")}
         aria-haspopup="dialog"
         aria-expanded={open}
+        title={title}
         onClick={() => onOpenChange(!open)}
       >
         {triggerContent ?? <>

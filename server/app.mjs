@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import { WebSocket as WebSocketClient, WebSocketServer } from "ws";
 
 import {
@@ -26,9 +26,12 @@ import { createCloudConfigStore } from "./cloud-config.mjs";
 import {
   CloudProxyError,
   createCloudProxy,
-  isLocalCompanionRoute,
+  isLocalCompanionRequest,
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
+import { createExternalWorkProviderRegistry } from "./external-work-providers.mjs";
+import { createAdoConfigStore } from "./ado-config.mjs";
+import { createAdoIntegration } from "./ado-integration.mjs";
 import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
@@ -602,8 +605,12 @@ function actorFromRequest(request) {
 
 function parseAssigneeTarget(value) {
   if (value === undefined) return undefined;
-  if (value !== "current-user" && value !== "codex-agent") {
-    throw new ApiError(400, "INVALID_FIELD", "'assigneeTarget' must be current-user or codex-agent");
+  if (value !== "current-user" && value !== "codex-agent" && value !== "unassigned") {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'assigneeTarget' must be current-user, codex-agent, or unassigned",
+    );
   }
   return value;
 }
@@ -611,10 +618,41 @@ function parseAssigneeTarget(value) {
 function resolveAssignee(target, actor) {
   if (target === undefined) return actor;
   if (target === "codex-agent") return CODEX_AGENT_ACTOR;
+  if (target === "unassigned") {
+    return { type: "user", id: "unassigned", name: "Unassigned", avatarUrl: null };
+  }
   if (actor.type !== "user") {
     throw new ApiError(400, "INVALID_FIELD", "'current-user' requires a user request identity");
   }
   return actor;
+}
+
+function parseActorIdentity(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["type", "id", "name", "avatarUrl"]));
+  if (value.type !== "user" && value.type !== "agent") {
+    throw new ApiError(400, "INVALID_FIELD", "'assignee.type' must be user or agent");
+  }
+  const avatarUrl = value.avatarUrl === null
+    ? null
+    : stringField(value.avatarUrl, "assignee.avatarUrl", { required: true, maxLength: 2048 });
+  if (avatarUrl !== null) {
+    let parsed;
+    try {
+      parsed = new URL(avatarUrl);
+    } catch {
+      throw new ApiError(400, "INVALID_FIELD", "'assignee.avatarUrl' must be a valid URL");
+    }
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      throw new ApiError(400, "INVALID_FIELD", "'assignee.avatarUrl' must use HTTP or HTTPS");
+    }
+  }
+  return {
+    type: value.type,
+    id: stringField(value.id, "assignee.id", { required: true, maxLength: 240 }),
+    name: stringField(value.name, "assignee.name", { required: true, maxLength: 120 }),
+    avatarUrl,
+  };
 }
 
 function parseTaskCreate(body) {
@@ -650,12 +688,15 @@ function parseTaskPatch(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "version", "projectId", "title", "description", "status", "priority", "labels", "threadId", "threadBinding",
-    "assigneeTarget", "developmentContext", "startDate", "dueDate", "recurrence",
+    "assignee", "assigneeTarget", "developmentContext", "startDate", "dueDate", "recurrence",
   ]));
   const version = parseVersion(body.version);
   const threadId = parseThreadId(body.threadId);
   const threadBinding = parseThreadBinding(body.threadBinding);
   const assigneeTarget = parseAssigneeTarget(body.assigneeTarget);
+  if (body.assignee !== undefined && assigneeTarget !== undefined) {
+    throw new ApiError(400, "INVALID_FIELD", "Use either 'assignee' or 'assigneeTarget', not both");
+  }
   const changes = {};
   if (body.projectId !== undefined) changes.projectId = validateProjectId(body.projectId);
   if (body.title !== undefined) changes.title = stringField(body.title, "title", { required: true, maxLength: 240 });
@@ -663,6 +704,7 @@ function parseTaskPatch(body) {
   if (body.status !== undefined) changes.status = parseStatus(body.status);
   if (body.priority !== undefined) changes.priority = parsePriority(body.priority);
   if (body.labels !== undefined) changes.labels = parseLabels(body.labels);
+  if (body.assignee !== undefined) changes.assignee = parseActorIdentity(body.assignee);
   if (body.developmentContext !== undefined) changes.developmentContext = parseDevelopmentContext(body.developmentContext);
   if (body.startDate !== undefined) changes.startDate = parseDueDate(body.startDate, "startDate");
   if (body.dueDate !== undefined) changes.dueDate = parseDueDate(body.dueDate);
@@ -1609,6 +1651,8 @@ export function resolveServerOptions(options = {}) {
     databasePath: options.databasePath ?? path.join(dataDirectory, "taskboard.sqlite"),
     attachmentsDirectory: options.attachmentsDirectory ?? path.join(dataDirectory, "attachments"),
     cloudConfigPath: options.cloudConfigPath ?? path.join(dataDirectory, "cloud-companion.json"),
+    adoConfigPath: options.adoConfigPath
+      ?? path.join(dataDirectory, "external-work", "ado.json"),
     jiraConfigPath: options.jiraConfigPath ?? path.join(dataDirectory, "jira-connection.json"),
     clientStoragePath: options.clientStoragePath ?? path.join(dataDirectory, "client-storage.json"),
     staticDirectory: options.staticDirectory ?? path.join(PROJECT_ROOT, "dist", "web"),
@@ -1694,6 +1738,30 @@ export function createTaskboardServer(options = {}) {
     database,
     fetch: options.jiraFetch ?? globalThis.fetch,
   });
+  const adoConfig = options.adoConfigStore ?? createAdoConfigStore({
+    configPath: resolved.adoConfigPath,
+  });
+  const ado = createAdoIntegration({
+    configStore: adoConfig,
+    fetch: options.adoFetch ?? globalThis.fetch,
+  });
+  const externalWorkProviders = createExternalWorkProviderRegistry({
+    providers: [jira.provider, ado.provider, ...(options.externalWorkProviders ?? [])],
+    database,
+  });
+  const externalProviderOperations = new Map();
+  async function runExternalProviderOperation(providerId, callback) {
+    const previous = externalProviderOperations.get(providerId) ?? Promise.resolve();
+    const operation = previous.catch(() => {}).then(callback);
+    externalProviderOperations.set(providerId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (externalProviderOperations.get(providerId) === operation) {
+        externalProviderOperations.delete(providerId);
+      }
+    }
+  }
   let hostRuntime = null;
   function currentHostThreadBinding(threadId) {
     if (
@@ -2052,6 +2120,14 @@ export function createTaskboardServer(options = {}) {
         : null;
       if (capabilityCloudConfig?.remoteUrl) assertLoopbackRequest(request);
 
+      if (pathname === "/api/copilot-host-actions" && options.hostActionHandler) {
+        assertNoQuery(url.searchParams, "Copilot host action routes");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertLoopbackRequest(request);
+        const result = await options.hostActionHandler(request, await readJson(request));
+        return sendJson(response, result.status, result.body);
+      }
+
       if (pathname === "/health") {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         if (resolved.instanceToken) {
@@ -2208,7 +2284,9 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Jira 连接接口不接受查询参数");
         }
         if (request.method === "GET") {
-          return sendJson(response, 200, { connection: await jira.status() });
+          return sendJson(response, 200, {
+            connection: await externalWorkProviders.connection("jira"),
+          });
         }
         if (request.method === "PUT") {
           const activeCloudConfig = await cloudConfig.read();
@@ -2232,14 +2310,17 @@ export function createTaskboardServer(options = {}) {
             throw new ApiError(400, "INVALID_FIELD", "'password' cannot exceed 4096 characters");
           }
           try {
-            const connection = await jira.configure({
-              baseUrl,
-              username,
-              password,
-              projects: body.projects,
-            });
+            const provider = await runExternalProviderOperation(
+              "jira",
+              () => externalWorkProviders.configure("jira", {
+                baseUrl,
+                username,
+                password,
+                projects: body.projects,
+              }),
+            );
             events.emit("project.labels.updated", { project: database.getProject(JIRA_PROJECT_ID) });
-            return sendJson(response, 200, { connection });
+            return sendJson(response, 200, { connection: provider.connection });
           } catch (error) {
             if (error instanceof ApiError) throw error;
             throw new ApiError(400, error.code ?? "INVALID_JIRA_CONFIG", error.message);
@@ -2254,9 +2335,12 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Jira 同步接口不接受查询参数");
         }
         await assertEmptyRequestBody(request, "POST /api/local/jira-connection/sync");
-        const connection = await jira.sync({ force: true });
+        const result = await runExternalProviderOperation(
+          "jira",
+          () => externalWorkProviders.synchronize("jira", { force: true }),
+        );
         events.emit("project.labels.updated", { project: database.getProject(JIRA_PROJECT_ID) });
-        return sendJson(response, 200, { connection });
+        return sendJson(response, 200, { connection: result.provider.connection });
       }
 
       const projectMappingRoute = pathname.match(/^\/api\/local\/project-mappings\/([^/]+)$/);
@@ -2464,13 +2548,82 @@ export function createTaskboardServer(options = {}) {
         currentCloudConfig = await cloudConfig.read();
         if (currentCloudConfig.remoteUrl) {
           assertLoopbackRequest(request);
-          if (!isLocalCompanionRoute(pathname)) {
+          if (!isLocalCompanionRequest(pathname, request.method, {
+            getTask: (id) => database.getTask(id),
+            getComment: (id) => database.getComment(id),
+          })) {
             return sendFetchResponse(
               response,
               await cloudProxy.forward(toFetchRequest(request)),
             );
           }
         }
+      }
+
+      if (pathname === "/api/external-work/providers") {
+        assertLoopbackRequest(request);
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/external-work/providers");
+        return sendJson(response, 200, { providers: await externalWorkProviders.list() });
+      }
+
+      const externalProviderRoute = pathname.match(
+        /^\/api\/external-work\/providers\/([^/]+)\/(connection|projects|actors|sync)$/,
+      );
+      if (externalProviderRoute) {
+        assertLoopbackRequest(request);
+        const providerId = decodeRouteSegment(externalProviderRoute[1], "providerId");
+        const action = externalProviderRoute[2];
+        assertNoQuery(url.searchParams, `${request.method} ${pathname}`);
+        if (action === "connection") {
+          if (request.method !== "PUT") return methodNotAllowed(response, ["PUT"]);
+          const configuration = await readJson(request);
+          assertPlainObject(configuration);
+          return sendJson(response, 200, {
+            provider: await runExternalProviderOperation(
+              providerId,
+              () => externalWorkProviders.configure(providerId, configuration),
+            ),
+          });
+        }
+        if (action === "projects") {
+          if (request.method === "GET") {
+            return sendJson(response, 200, await externalWorkProviders.discover(providerId));
+          }
+          if (request.method === "POST") {
+            const configuration = await readJson(request);
+            assertPlainObject(configuration);
+            return sendJson(
+              response,
+              200,
+              await runExternalProviderOperation(
+                providerId,
+                () => externalWorkProviders.discover(providerId, configuration),
+              ),
+            );
+          }
+          return methodNotAllowed(response, ["GET", "POST"]);
+        }
+        if (action === "actors") {
+          if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+          return sendJson(
+            response,
+            200,
+            await runExternalProviderOperation(providerId, () => externalWorkProviders.actors(providerId)),
+          );
+        }
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        await assertEmptyRequestBody(request, `POST ${pathname}`);
+        const result = await runExternalProviderOperation(
+          providerId,
+          () => externalWorkProviders.synchronize(providerId),
+        );
+        events.emit("external-work.synced", {
+          providerId,
+          projectIds: result.projects.map((project) => project.id),
+          taskIds: result.tasks.map((task) => task.id),
+        });
+        return sendJson(response, 200, result);
       }
 
       if (pathname === "/api/projects") {
@@ -2670,7 +2823,12 @@ export function createTaskboardServer(options = {}) {
       if (pathname === "/api/tasks") {
         if (request.method === "GET") {
           const filters = parseTaskFilters(url.searchParams);
-          if (!filters.projectId || filters.projectId === JIRA_PROJECT_ID) await jira.sync();
+          if (!filters.projectId || filters.projectId === JIRA_PROJECT_ID) {
+            await runExternalProviderOperation(
+              "jira",
+              () => externalWorkProviders.synchronize("jira"),
+            );
+          }
           return sendJson(response, 200, { tasks: database.listTasks(filters) });
         }
         if (request.method === "POST") {
@@ -2682,6 +2840,14 @@ export function createTaskboardServer(options = {}) {
               409,
               "JIRA_CREATE_UNAVAILABLE",
               "请在 Jira 中新建议题，Taskboard 当前只同步已分配给你的任务",
+            );
+          }
+          const targetProject = database.getProject(input.projectId);
+          if (targetProject && targetProject.source !== "local") {
+            throw new ApiError(
+              409,
+              "EXTERNAL_CREATE_UNAVAILABLE",
+              `Provider '${targetProject.source}' does not support creating tasks`,
             );
           }
           const task = database.createTask({
@@ -2812,10 +2978,37 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Comment routes do not accept query parameters");
         }
         if (request.method === "POST") {
-          const comment = database.createComment(taskId, {
-            ...resolveInputThreadBinding(parseCommentCreate(await readJson(request))),
-            actor: actorFromRequest(request),
-          });
+          const current = database.getTask(taskId);
+          if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+          if (current.source !== "local" && externalWorkProviders.supportsComments(current.source)) {
+            assertLoopbackRequest(request);
+          }
+          const input = resolveInputThreadBinding(parseCommentCreate(await readJson(request)));
+          const comment = current.source === "local"
+            || !externalWorkProviders.supportsComments(current.source)
+            ? database.createComment(taskId, {
+              ...input,
+              actor: actorFromRequest(request),
+            })
+            : await runExternalProviderOperation(current.source, async () => {
+              const authoritative = await externalWorkProviders.addComment(
+                current.source,
+                current,
+                input,
+              );
+              try {
+                return database.createComment(taskId, {
+                  ...input,
+                  ...authoritative,
+                });
+              } catch {
+                throw new ApiError(
+                  502,
+                  "EXTERNAL_COMMENT_PERSIST_FAILED",
+                  "The external provider accepted the comment, but Taskboard could not persist the authoritative result; synchronize to converge",
+                );
+              }
+            });
           const task = database.getTask(taskId);
           events.emit("comment.created", { comment, task });
           return sendJson(response, 201, { comment });
@@ -2839,6 +3032,19 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "PATCH") {
           const patch = resolveInputThreadBinding(parseCommentPatch(await readJson(request)));
+          const current = database.getComment(id);
+          const currentTask = current ? database.getTask(current.taskId) : null;
+          if (
+            currentTask
+            && currentTask.source !== "local"
+            && externalWorkProviders.supportsComments(currentTask.source)
+          ) {
+            throw new ApiError(
+              409,
+              "EXTERNAL_COMMENT_MUTATION_UNSUPPORTED",
+              "External comments cannot be edited in Taskboard",
+            );
+          }
           const comment = database.updateComment(
             id,
             patch.version,
@@ -2852,6 +3058,19 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "DELETE") {
           const { version } = parseArchive(await readJson(request));
+          const current = database.getComment(id);
+          const currentTask = current ? database.getTask(current.taskId) : null;
+          if (
+            currentTask
+            && currentTask.source !== "local"
+            && externalWorkProviders.supportsComments(currentTask.source)
+          ) {
+            throw new ApiError(
+              409,
+              "EXTERNAL_COMMENT_MUTATION_UNSUPPORTED",
+              "External comments cannot be deleted in Taskboard",
+            );
+          }
           const comment = database.deleteComment(id, version);
           for (const attachment of comment.attachments) {
             try {
@@ -3058,6 +3277,9 @@ export function createTaskboardServer(options = {}) {
         }
         if (!action && request.method === "PATCH") {
           const actor = actorFromRequest(request);
+          const current = database.getTask(id);
+          if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (current.source !== "local") assertLoopbackRequest(request);
           const {
             version,
             changes,
@@ -3065,9 +3287,133 @@ export function createTaskboardServer(options = {}) {
             threadBinding,
             assigneeTarget,
           } = resolveInputThreadBinding(parseTaskPatch(await readJson(request)));
-          const current = database.getTask(id);
-          if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
-          let jiraChanged = false;
+          if (assigneeTarget === "unassigned" && current.source === "local") {
+            throw new ApiError(
+              400,
+              "INVALID_FIELD",
+              "Local tasks do not support an unassigned assignee",
+            );
+          }
+          if (Object.hasOwn(changes, "assignee") && current.source === "local") {
+            throw new ApiError(
+              400,
+              "INVALID_FIELD",
+              "Local tasks require an assignee target",
+            );
+          }
+          const externalProviderId = current.source !== "local" ? current.source : null;
+          if (externalProviderId) {
+            return await runExternalProviderOperation(externalProviderId, async () => {
+              const latest = database.getTask(id);
+              if (latest.version !== version) {
+                throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
+                  expectedVersion: version,
+                  actualVersion: latest.version,
+                });
+              }
+              if (latest.archivedAt !== null) {
+                throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be updated");
+              }
+              if (Object.hasOwn(changes, "projectId")) {
+                throw new ApiError(
+                  409,
+                  externalProviderId === "jira"
+                    ? "JIRA_PROJECT_MOVE_UNAVAILABLE"
+                    : "EXTERNAL_PROJECT_MOVE_UNAVAILABLE",
+                  externalProviderId === "jira"
+                    ? "Jira 任务不能移到本地项目"
+                    : "External tasks cannot move between Taskboard projects",
+                );
+              }
+              if (externalProviderId === "jira" && assigneeTarget !== undefined) {
+                throw new ApiError(409, "JIRA_ASSIGNEE_UNAVAILABLE", "请在 Jira 中修改经办人");
+              }
+              if (
+                assigneeTarget === "unassigned"
+                && !externalWorkProviders.supportsMutation(externalProviderId, "assignee")
+              ) {
+                throw new ApiError(
+                  409,
+                  "EXTERNAL_MUTATION_UNSUPPORTED",
+                  "This external provider does not support unassignment",
+                );
+              }
+              const dueDate = Object.hasOwn(changes, "dueDate") ? changes.dueDate : latest.dueDate;
+              const recurrence = Object.hasOwn(changes, "recurrence")
+                ? changes.recurrence
+                : latest.recurrence;
+              if (recurrence && !dueDate) {
+                throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires a due date");
+              }
+              const providerChanges = { ...changes };
+              if (assigneeTarget !== undefined) {
+                providerChanges.assignee = resolveAssignee(assigneeTarget, actor);
+              }
+              const effectiveProviderChanges = Object.fromEntries(
+                Object.entries(providerChanges).filter(([field, value]) => (
+                  !isDeepStrictEqual(latest[field], value)
+                )),
+              );
+              const { remoteChanges, localChanges } = externalWorkProviders.planTaskMutation(
+                externalProviderId,
+                effectiveProviderChanges,
+              );
+              const providerResult = Object.keys(remoteChanges).length > 0
+                ? await externalWorkProviders.mutateTask(
+                  externalProviderId,
+                  latest,
+                  remoteChanges,
+                )
+                : { authoritative: false, changed: false };
+              if (providerResult.authoritative) {
+                const hasLocalUpdate = Object.keys(localChanges).length > 0
+                  || threadId !== undefined
+                  || threadBinding !== undefined;
+                const task = hasLocalUpdate
+                  ? database.updateTask(
+                    id,
+                    providerResult.task.version,
+                    localChanges,
+                    threadId,
+                    threadBinding,
+                    actor,
+                  )
+                  : providerResult.task;
+                events.emit("task.updated", { task });
+                return sendJson(response, 200, { task });
+              }
+              const persistedChanges = { ...remoteChanges, ...localChanges };
+              let task;
+              try {
+                task = database.updateTask(
+                  id,
+                  version,
+                  persistedChanges,
+                  threadId,
+                  threadBinding,
+                  actor,
+                );
+              } catch (error) {
+                if (externalProviderId === "jira" && providerResult.changed) {
+                  try {
+                    await externalWorkProviders.synchronize("jira", {
+                      force: true,
+                      archiveMissing: false,
+                    });
+                  } catch {
+                    throw new ApiError(
+                      502,
+                      "JIRA_RECONCILE_FAILED",
+                      "Jira 已更新，但 Taskboard 重新同步失败，请手动同步",
+                    );
+                  }
+                }
+                throw error;
+              }
+              events.emit("task.updated", { task });
+              return sendJson(response, 200, { task });
+            });
+          }
           if (current.source !== "jira" && changes.projectId === JIRA_PROJECT_ID) {
             throw new ApiError(
               409,
@@ -3075,51 +3421,10 @@ export function createTaskboardServer(options = {}) {
               "本地任务不能移入 Jira 同步项目",
             );
           }
-          if (current.source === "jira") {
-            if (current.version !== version) {
-              throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
-                expectedVersion: version,
-                actualVersion: current.version,
-              });
-            }
-            if (current.archivedAt !== null) {
-              throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be updated");
-            }
-            if (Object.hasOwn(changes, "projectId")) {
-              throw new ApiError(409, "JIRA_PROJECT_MOVE_UNAVAILABLE", "Jira 任务不能移到本地项目");
-            }
-            if (assigneeTarget !== undefined) {
-              throw new ApiError(409, "JIRA_ASSIGNEE_UNAVAILABLE", "请在 Jira 中修改经办人");
-            }
-            const dueDate = Object.hasOwn(changes, "dueDate") ? changes.dueDate : current.dueDate;
-            const recurrence = Object.hasOwn(changes, "recurrence")
-              ? changes.recurrence
-              : current.recurrence;
-            if (recurrence && !dueDate) {
-              throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires a due date");
-            }
-            jiraChanged = await jira.updateTask(current, changes);
-          }
           if (assigneeTarget !== undefined) {
             changes.assignee = resolveAssignee(assigneeTarget, actor);
           }
-          let task;
-          try {
-            task = database.updateTask(id, version, changes, threadId, threadBinding, actor);
-          } catch (error) {
-            if (jiraChanged) {
-              try {
-                await jira.reconcile();
-              } catch {
-                throw new ApiError(
-                  502,
-                  "JIRA_RECONCILE_FAILED",
-                  "Jira 已更新，但 Taskboard 重新同步失败，请手动同步",
-                );
-              }
-            }
-            throw error;
-          }
+          const task = database.updateTask(id, version, changes, threadId, threadBinding, actor);
           events.emit("task.updated", { task });
           return sendJson(response, 200, { task });
         }
@@ -3127,6 +3432,13 @@ export function createTaskboardServer(options = {}) {
           const current = database.getTask(id);
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_DELETE_UNAVAILABLE", "Jira 任务不能从 Taskboard 永久删除");
+          }
+          if (current && current.source !== "local") {
+            throw new ApiError(
+              409,
+              "EXTERNAL_DELETE_UNAVAILABLE",
+              "External tasks cannot be permanently deleted from Taskboard",
+            );
           }
           const { version } = parseArchive(await readJson(request));
           const deleted = database.deleteArchivedTask(id, version);
@@ -3141,20 +3453,76 @@ export function createTaskboardServer(options = {}) {
           return sendEmpty(response, 204);
         }
         if (action === "move" && request.method === "POST") {
-          const move = resolveInputThreadBinding(parseMove(await readJson(request)));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
-          if (current.source === "jira") {
-            if (current.version !== move.version) {
-              throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
-                expectedVersion: move.version,
-                actualVersion: current.version,
-              });
-            }
-            if (current.archivedAt !== null) {
-              throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
-            }
-            await jira.moveTask(current, move.status);
+          if (current.source !== "local") assertLoopbackRequest(request);
+          const move = resolveInputThreadBinding(parseMove(await readJson(request)));
+          if (current.source !== "local") {
+            return await runExternalProviderOperation(current.source, async () => {
+              const latest = database.getTask(id);
+              if (latest.version !== move.version) {
+                throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
+                  expectedVersion: move.version,
+                  actualVersion: latest.version,
+                });
+              }
+              if (latest.archivedAt !== null) {
+                throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
+              }
+              if (
+                move.status === latest.status
+                && externalWorkProviders.hasAuthoritativeMutations(latest.source)
+              ) {
+                throw new ApiError(
+                  409,
+                  "EXTERNAL_MUTATION_UNSUPPORTED",
+                  "This external task does not support local-only reordering",
+                );
+              }
+              if (
+                move.sortOrder !== undefined
+                && externalWorkProviders.hasAuthoritativeMutations(latest.source)
+              ) {
+                throw new ApiError(
+                  409,
+                  "EXTERNAL_MUTATION_UNSUPPORTED",
+                  "This external task does not support local-only reordering",
+                );
+              }
+              if (move.status !== latest.status) {
+                const providerResult = await externalWorkProviders.mutateTask(
+                  latest.source,
+                  latest,
+                  { status: move.status },
+                );
+                if (providerResult.authoritative) {
+                  const refreshed = providerResult.task;
+                  const task = move.threadId !== undefined || move.threadBinding !== undefined
+                    ? database.updateTask(
+                      id,
+                      refreshed.version,
+                      {},
+                      move.threadId,
+                      move.threadBinding,
+                      actorFromRequest(request),
+                    )
+                    : refreshed;
+                  events.emit("task.moved", { task });
+                  return sendJson(response, 200, { task });
+                }
+              }
+              const task = database.moveTask(
+                id,
+                move.version,
+                move.status,
+                move.sortOrder,
+                move.threadId,
+                move.threadBinding,
+                actorFromRequest(request),
+              );
+              events.emit("task.moved", { task });
+              return sendJson(response, 200, { task });
+            });
           }
           const task = database.moveTask(
             id,
@@ -3173,6 +3541,13 @@ export function createTaskboardServer(options = {}) {
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_ARCHIVE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动归档");
           }
+          if (current && current.source !== "local") {
+            throw new ApiError(
+              409,
+              "EXTERNAL_ARCHIVE_UNAVAILABLE",
+              "External tasks are archived by provider synchronization",
+            );
+          }
           const { version, threadId, threadBinding } = resolveInputThreadBinding(
             parseArchive(await readJson(request)),
           );
@@ -3190,6 +3565,13 @@ export function createTaskboardServer(options = {}) {
           const current = database.getTask(id);
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_RESTORE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动恢复");
+          }
+          if (current && current.source !== "local") {
+            throw new ApiError(
+              409,
+              "EXTERNAL_RESTORE_UNAVAILABLE",
+              "External tasks are restored by provider synchronization",
+            );
           }
           const { version, threadId, threadBinding } = resolveInputThreadBinding(
             parseArchive(await readJson(request)),

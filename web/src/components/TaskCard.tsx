@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
-import { resolvePersistedAttachmentUrl } from "../api";
+import { resolvePersistedAttachmentUrl, type ExternalWorkProviderDescription } from "../api";
+import { canMutateTaskField, externalWriteSetFor } from "../externalWriteSet";
 import {
   TASK_PRIORITIES,
   type ActorIdentity,
@@ -13,7 +14,12 @@ import {
 } from "../types";
 import { labelPresentation } from "../labels";
 import { taskPriorityLabel, useTaskboardI18n } from "../i18n";
-import { CODEX_AGENT_ACTOR, actorKey, assigneeTargetForActor } from "../actors";
+import {
+  CODEX_AGENT_ACTOR,
+  UNASSIGNED_ACTOR,
+  actorKey,
+  assigneeTargetForActor,
+} from "../actors";
 import type {
   TaskCardPresentation,
   TaskConversationItem,
@@ -38,6 +44,7 @@ interface TaskCardProps {
   isSettling: boolean;
   isContextMenuOpen: boolean;
   availableLabels: string[];
+  externalProviders: ExternalWorkProviderDescription[];
   projectName?: string;
   currentUser: ActorIdentity;
   showCover: boolean;
@@ -354,7 +361,9 @@ function AssigneeControl({
 }) {
   const { text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
-  const options = [task.assignee, currentUser, CODEX_AGENT_ACTOR]
+  const options = (task.source !== "local" && task.source !== "jira"
+    ? [task.assignee, UNASSIGNED_ACTOR]
+    : [task.assignee, currentUser, CODEX_AGENT_ACTOR])
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));
@@ -394,6 +403,7 @@ export function TaskCard({
   isSettling,
   isContextMenuOpen,
   availableLabels,
+  externalProviders,
   projectName,
   currentUser,
   showCover,
@@ -435,6 +445,8 @@ export function TaskCard({
   const showsProperties = Boolean(projectName)
     || (!processingCard && (hasProperties || showsInlineParticipants || showsConversation));
   const propertyDisabled = savingProperty !== null;
+  const externalWriteSet = externalWriteSetFor(externalProviders, task.source);
+  const canEdit = (field: string) => canMutateTaskField(task.source, field, externalWriteSet);
 
   function updateProperty(changes: Partial<TaskDraft>, property: NonNullable<typeof savingProperty>) {
     setSavingProperty(property);
@@ -497,7 +509,7 @@ export function TaskCard({
               task={task}
               participants={task.participants.length ? task.participants : [creator]}
               currentUser={currentUser}
-              disabled={propertyDisabled || task.source === "jira"}
+              disabled={propertyDisabled || !canEdit("assignee")}
               open={propertyMenu === "assignee"}
               onOpenChange={(open) => setPropertyMenu(open ? "assignee" : null)}
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
@@ -526,7 +538,7 @@ export function TaskCard({
           {!processingCard && task.priority !== "none" && (
             <PriorityControl
               task={task}
-              disabled={propertyDisabled}
+              disabled={propertyDisabled || !canEdit("priority")}
               open={propertyMenu === "priority"}
               onOpenChange={(open) => setPropertyMenu(open ? "priority" : null)}
               onChange={(priority) => updateProperty({ priority }, "priority")}
@@ -537,7 +549,7 @@ export function TaskCard({
               availableLabels={availableLabels}
               selectedLabels={task.labels}
               open={propertyMenu === "labels"}
-              disabled={propertyDisabled}
+              disabled={propertyDisabled || !canEdit("labels")}
               className="card-label-picker card-property-control"
               triggerClassName="card-label-trigger"
               triggerContent={<TaskLabels task={task} />}
@@ -549,7 +561,7 @@ export function TaskCard({
           {!processingCard && (
             <DueDateControl
               task={task}
-              disabled={propertyDisabled}
+              disabled={propertyDisabled || !canEdit("dueDate")}
               onChange={(dueDate) => updateProperty({
                 dueDate,
                 ...(dueDate ? {} : { recurrence: null }),
@@ -561,7 +573,7 @@ export function TaskCard({
               task={task}
               participants={task.participants}
               currentUser={currentUser}
-              disabled={propertyDisabled || task.source === "jira"}
+              disabled={propertyDisabled || !canEdit("assignee")}
               open={propertyMenu === "assignee"}
               onOpenChange={(open) => setPropertyMenu(open ? "assignee" : null)}
               onChange={(assigneeTarget) => updateProperty({ assigneeTarget }, "assignee")}
