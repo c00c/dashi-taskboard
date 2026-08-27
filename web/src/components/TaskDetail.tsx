@@ -16,12 +16,12 @@ import {
   listAttachments,
   listComments,
   listExternalWorkActors,
-  listExternalWorkProviders,
   listTaskActivities,
   resolveTaskboardUrl,
   uploadAttachment,
   uploadCommentAttachment,
   updateComment,
+  type ExternalWorkProviderDescription,
 } from "../api";
 import {
   taskPriorityLabel,
@@ -56,7 +56,6 @@ import {
 import {
   canMutateTaskField,
   externalWriteSetFor,
-  type ExternalWriteSet,
 } from "../externalWriteSet";
 import { ActorAvatar } from "./ActorAvatar";
 import { STATUS_DETAILS } from "./BoardColumn";
@@ -116,6 +115,7 @@ interface TaskDetailProps {
   referenceTasks: Task[];
   currentUser: ActorIdentity;
   availableLabels: string[];
+  externalProviders: ExternalWorkProviderDescription[];
   developmentScan: DevelopmentScan;
   developmentScanLoading: boolean;
   commentsRevision: number;
@@ -393,6 +393,7 @@ export function TaskDetail({
   referenceTasks,
   currentUser,
   availableLabels,
+  externalProviders,
   developmentScan,
   developmentScanLoading,
   commentsRevision,
@@ -423,7 +424,6 @@ export function TaskDetail({
   >(null);
   const [savingProperty, setSavingProperty] = useState<string | null>(null);
   const [externalAssignees, setExternalAssignees] = useState<ActorIdentity[]>([]);
-  const [externalWriteSet, setExternalWriteSet] = useState<ExternalWriteSet | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [attachmentsError, setAttachmentsError] = useState<TaskDetailError | null>(null);
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
@@ -496,21 +496,6 @@ export function TaskDetail({
     );
     return () => controller.abort();
   }, [task.id, task.source]);
-
-  useEffect(() => {
-    if (task.source === "local") {
-      setExternalWriteSet(null);
-      return;
-    }
-    const controller = new AbortController();
-    void listExternalWorkProviders(controller.signal).then(
-      (providers) => setExternalWriteSet(externalWriteSetFor(providers, task.source)),
-      (error) => {
-        if ((error as Error).name !== "AbortError") onError(messageFor(error));
-      },
-    );
-    return () => controller.abort();
-  }, [task.source]);
 
   useEffect(() => {
     if (!editingDescription) return;
@@ -1053,7 +1038,7 @@ export function TaskDetail({
   const canEdit = (field: string) => canMutateTaskField(
     currentTask.source,
     field,
-    externalWriteSet,
+    externalWriteSetFor(externalProviders, currentTask.source),
   );
   const externallyOwned = text(
     "该字段由外部系统管理，无法在 Taskboard 中修改。",

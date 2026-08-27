@@ -37,6 +37,7 @@ import {
   listArchivedTasks,
   listDevelopmentContexts,
   listDeviceWorkspaces,
+  listExternalWorkProviders,
   listProjects,
   listTasks,
   moveTask as moveTaskRequest,
@@ -52,6 +53,7 @@ import {
   syncJiraConnection,
   uploadAttachment,
   updateTask as updateTaskRequest,
+  type ExternalWorkProviderDescription,
 } from "./api";
 import {
   actorKey,
@@ -802,6 +804,7 @@ export function App() {
     stateMapping: {},
   });
   const [adoRepositories, setAdoRepositories] = useState<AdoDiscoveredProject[]>([]);
+  const [externalProviders, setExternalProviders] = useState<ExternalWorkProviderDescription[]>([]);
   const [adoBusy, setAdoBusy] = useState(false);
   const [adoError, setAdoError] = useState<string | null>(null);
   const [adoStatus, setAdoStatus] = useState<string | null>(null);
@@ -1901,6 +1904,15 @@ export function App() {
     void loadProjectList(controller.signal);
     return () => controller.abort();
   }, [loadProjectList]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void listExternalWorkProviders(controller.signal).then(
+      setExternalProviders,
+      () => {},
+    );
+    return () => controller.abort();
+  }, [adoConnection, jiraConnection]);
 
   const refreshProjectList = useCallback(async () => {
     const requestId = ++projectsRequestRef.current;
@@ -3821,6 +3833,7 @@ export function App() {
             referenceTasks={referenceTasks.filter((task) => task.projectId === detailTask.projectId)}
             currentUser={currentUser}
             availableLabels={availableLabels}
+            externalProviders={externalProviders}
             developmentScan={developmentScan}
             developmentScanLoading={developmentScanLoading}
             commentsRevision={commentsRevision}
@@ -3979,6 +3992,7 @@ export function App() {
                         settlingTaskId={settlingTaskId}
                         contextMenuTaskId={contextMenu?.taskId ?? null}
                         availableLabels={availableLabels}
+                        externalProviders={externalProviders}
                         projectNames={isAllProjects ? projectNames : undefined}
                         currentUser={currentUser}
                         showCover={boardDisplaySettings.cover}
@@ -4016,6 +4030,7 @@ export function App() {
                     settlingTaskId={settlingTaskId}
                     contextMenuTaskId={contextMenu?.taskId ?? null}
                     availableLabels={availableLabels}
+                    externalProviders={externalProviders}
                     projectNames={isAllProjects ? projectNames : undefined}
                     currentUser={currentUser}
                     showCover={boardDisplaySettings.cover}

@@ -85,8 +85,25 @@ function makeTask(overrides: Partial<Task>): Task {
   };
 }
 
-function renderDetail(task: Task) {
-  return render(
+const providers = [
+  {
+    id: "ado",
+    displayName: "Azure DevOps",
+    connection: { configured: true },
+    supportedMutations: ["status", "assignee"],
+    localOnlyMutations: ["developmentContext"],
+  },
+  {
+    id: "jira",
+    displayName: "Jira",
+    connection: { configured: true },
+    supportedMutations: ["status", "title", "description", "priority", "labels", "dueDate"],
+    localOnlyMutations: ["developmentContext", "startDate", "recurrence"],
+  },
+];
+
+function detailTree(task: Task) {
+  return (
     <TaskboardLanguageProvider language="en">
       <TaskDetail
         task={task}
@@ -94,6 +111,7 @@ function renderDetail(task: Task) {
         referenceTasks={[]}
         currentUser={currentUser}
         availableLabels={["bug"]}
+        externalProviders={providers}
         developmentScan={developmentScan}
         developmentScanLoading={false}
         commentsRevision={0}
@@ -111,8 +129,12 @@ function renderDetail(task: Task) {
         openingThread={false}
         onError={() => {}}
       />
-    </TaskboardLanguageProvider>,
+    </TaskboardLanguageProvider>
   );
+}
+
+function renderDetail(task: Task) {
+  return render(detailTree(task));
 }
 
 function button(name: string): HTMLButtonElement {
@@ -180,5 +202,20 @@ describe("TaskDetail external write set", () => {
     const dateInputs = document.querySelectorAll<HTMLInputElement>("input[type=date]");
     expect(dateInputs.length).toBe(2);
     dateInputs.forEach((input) => expect(input.disabled).toBe(false));
+  });
+
+  it("evaluates a newly shown task against its own provider", async () => {
+    const { rerender } = renderDetail(makeTask({ source: "jira", externalOrigin: "jira:example" }));
+    await waitFor(() => expect(button("Assignee").disabled).toBe(true));
+
+    rerender(detailTree(makeTask({
+      id: "task-2",
+      identifier: "TB-2",
+      source: "ado",
+      externalOrigin: "ado:example-org",
+    })));
+
+    expect(button("Priority").disabled).toBe(true);
+    expect(button("Assignee").disabled).toBe(false);
   });
 });
