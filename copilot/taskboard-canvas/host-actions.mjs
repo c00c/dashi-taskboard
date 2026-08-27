@@ -8,6 +8,12 @@ function requiredText(value, name) {
   return { value: value.trim() };
 }
 
+function boundedSessionName(title) {
+  const codePoints = Array.from(title);
+  if (codePoints.length <= 40) return title;
+  return `${codePoints.slice(0, 39).join("").trimEnd()}…`;
+}
+
 function hasExactKeys(value, expectedKeys) {
   return isDeepStrictEqual(
     Object.keys(value).sort(),
@@ -280,7 +286,7 @@ export function createCopilotHostActions({ sessionSender, sessionId }) {
         mode: "autopilot",
         prompt: sessionPrompt,
       },
-      name: values.title,
+      name: boundedSessionName(values.title),
       workspace_type: "worktree",
     };
     const prompt = `Call create_session exactly once with these arguments and do not call another tool: ${JSON.stringify(expectedArguments)}`;

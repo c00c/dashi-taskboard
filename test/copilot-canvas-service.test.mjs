@@ -178,6 +178,45 @@ test("Copilot canvas creates a coding session with the task and workspace contex
   });
 });
 
+test("Copilot canvas bounds long coding session names without losing task context", async () => {
+  const sent = [];
+  const title = "Implement deterministic Copilot canvas session naming for exceptionally long Taskboard issue titles";
+  const { service } = await createService({
+    sessionSender: controlledSessionSender(successfulToolEvents("create_session"), sent),
+  });
+  const opened = await service.open({ instanceId: "long-session-name-panel" });
+
+  const result = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: {
+      action: "create-session",
+      task: {
+        identifier: "TASK-240",
+        title,
+        instruction: "Retain every part of the original task context.",
+        repository: "c00c/dashi-taskboard",
+        workspacePath: "C:\\work\\dashi-taskboard",
+      },
+    },
+  });
+
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.body, { ok: true });
+  assert.equal(sent.length, 1);
+  const toolArguments = toolArgumentsFromPrompt(sent[0]);
+  assert.equal(Array.from(toolArguments.name).length <= 40, true);
+  assert.equal(toolArguments.name, "Implement deterministic Copilot canvas…");
+  assert.equal(
+    toolArguments.kickoff.prompt,
+    [
+      `Taskboard issue: TASK-240 - ${title}`,
+      "Instruction: Retain every part of the original task context.",
+      "Repository: c00c/dashi-taskboard",
+      "Workspace context: C:\\work\\dashi-taskboard",
+    ].join("\n"),
+  );
+});
+
 test("Copilot canvas jumps back to its active app session", async () => {
   const sent = [];
   const { service } = await createService({

@@ -99,6 +99,7 @@ import {
   postEmbeddedHostMessage,
   setEmbeddedFrameChallenge,
 } from "./embeddedHost.mjs";
+import { installCopilotExternalLinkHandler } from "./copilotExternalLinks";
 import { buildIssueUrl, readIssueIdentifier } from "./issueRoute";
 import {
   getTaskboardI18n,
@@ -1686,21 +1687,12 @@ export function App() {
 
   useEffect(() => {
     if (host !== "copilot") return;
-    function handleExternalLink(event: MouseEvent) {
-      const link = event.target instanceof Element
-        ? event.target.closest<HTMLAnchorElement>('a[target="_blank"]')
-        : null;
-      if (!link) return;
-      const rawHref = link.getAttribute("href");
-      if (!rawHref) return;
-      event.preventDefault();
-      void openCopilotExternalLink(rawHref).then(
-        () => setAnnouncement(textRef.current("链接已在 Copilot 中打开。", "Link opened in Copilot.")),
-        (error) => setActionError(errorMessage(error)),
-      );
-    }
-    document.addEventListener("click", handleExternalLink, true);
-    return () => document.removeEventListener("click", handleExternalLink, true);
+    return installCopilotExternalLinkHandler({
+      currentUrl: window.location.href,
+      openExternalLink: openCopilotExternalLink,
+      onSuccess: () => setAnnouncement(textRef.current("链接已在 Copilot 中打开。", "Link opened in Copilot.")),
+      onError: (error) => setActionError(errorMessage(error)),
+    });
   }, [host]);
 
   useEffect(() => {
