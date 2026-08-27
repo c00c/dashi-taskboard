@@ -33,10 +33,31 @@ async function createService(options = {}) {
   return { dataDirectory, service, taskboardOptions };
 }
 
+function controlledSessionSender(events, sent = []) {
+  return async (message) => {
+    sent.push(message);
+    if (events instanceof Error) throw events;
+    return events;
+  };
+}
+
+function successfulToolEvents(toolName) {
+  return [
+    {
+      type: "tool.execution_start",
+      data: { toolCallId: "host-action-call", toolName },
+    },
+    {
+      type: "tool.execution_complete",
+      data: { toolCallId: "host-action-call", success: true },
+    },
+  ];
+}
+
 test("Copilot canvas creates a coding session with the task and workspace context", async () => {
   const sent = [];
   const { service } = await createService({
-    sessionSender: async (message) => sent.push(message),
+    sessionSender: controlledSessionSender(successfulToolEvents("create_session"), sent),
     sessionId: "active-copilot-session",
   });
   const opened = await service.open({ instanceId: "host-actions-panel" });
@@ -68,7 +89,7 @@ test("Copilot canvas creates a coding session with the task and workspace contex
 test("Copilot canvas jumps back to its active app session", async () => {
   const sent = [];
   const { service } = await createService({
-    sessionSender: async (message) => sent.push(message),
+    sessionSender: controlledSessionSender(successfulToolEvents("navigate_to"), sent),
     sessionId: "active-copilot-session",
   });
   const opened = await service.open({ instanceId: "jump-panel" });
@@ -88,7 +109,7 @@ test("Copilot canvas jumps back to its active app session", async () => {
 test("Copilot canvas opens only HTTP and HTTPS external links through the host", async () => {
   const sent = [];
   const { service } = await createService({
-    sessionSender: async (message) => sent.push(message),
+    sessionSender: controlledSessionSender(successfulToolEvents("open_canvas"), sent),
   });
   const opened = await service.open({ instanceId: "external-link-panel" });
 
@@ -111,9 +132,9 @@ test("Copilot canvas opens only HTTP and HTTPS external links through the host",
 
 test("Copilot host failures are returned to the canvas instead of looking successful", async () => {
   const { service } = await createService({
-    sessionSender: async () => {
-      throw new Error("Copilot session sender rejected the request");
-    },
+    sessionSender: controlledSessionSender(
+      new Error("Copilot session sender rejected the request"),
+    ),
   });
   const opened = await service.open({ instanceId: "failed-action-panel" });
 
@@ -140,9 +161,141 @@ test("Copilot host failures are returned to the canvas instead of looking succes
   });
 });
 
+for (const failure of [
+  {
+    name: "expected tool execution fails",
+    events: [
+      {
+        type: "tool.execution_start",
+        data: { toolCallId: "failed-call", toolName: "create_session" },
+      },
+      {
+        type: "tool.execution_complete",
+        data: {
+          toolCallId: "failed-call",
+          success: false,
+          error: { message: "Session creation was rejected" },
+        },
+      },
+    ],
+  },
+  {
+    name: "expected tool execution is absent",
+    events: [],
+  },
+  {
+    name: "only the wrong tool executes",
+    events: successfulToolEvents("navigate_to"),
+  },
+]) {
+  test(`Copilot host action fails when ${failure.name}`, async () => {
+    const { service } = await createService({
+      sessionSender: controlledSessionSender(failure.events),
+    });
+    const opened = await service.open({ instanceId: `structured-failure-${failure.name}` });
+
+    const result = await request(opened.url, "/api/copilot-host-actions", {
+      method: "POST",
+      body: {
+        action: "create-session",
+        task: {
+          identifier: "TASK-44",
+          title: "Require structured host completion",
+          instruction: "Return success only after create_session succeeds.",
+          repository: "c00c/dashi-taskboard",
+          workspacePath: "C:\\work\\dashi-taskboard",
+        },
+      },
+    });
+
+    assert.equal(result.response.status, 502);
+    assert.equal(result.body.error.code, "COPILOT_HOST_ACTION_FAILED");
+  });
+}
+
+test("concurrent Copilot host actions use separate session event windows", async () => {
+  let inFlight = 0;
+  let maximumInFlight = 0;
+  const { service } = await createService({
+    sessionSender: async () => {
+      inFlight += 1;
+      maximumInFlight = Math.max(maximumInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      inFlight -= 1;
+      return successfulToolEvents("create_session");
+    },
+  });
+  const opened = await service.open({ instanceId: "concurrent-host-actions" });
+  const body = {
+    action: "create-session",
+    task: {
+      identifier: "TASK-45",
+      title: "Isolate host event windows",
+      instruction: "Do not share one tool completion between requests.",
+      repository: "c00c/dashi-taskboard",
+      workspacePath: "C:\\work\\dashi-taskboard",
+    },
+  };
+
+  const results = await Promise.all([
+    request(opened.url, "/api/copilot-host-actions", { method: "POST", body }),
+    request(opened.url, "/api/copilot-host-actions", { method: "POST", body }),
+  ]);
+
+  assert.deepEqual(results.map(({ response }) => response.status), [200, 200]);
+  assert.equal(maximumInFlight, 1);
+});
+
+test("a timed-out host action retains its session event window until idle", async () => {
+  let closeEventWindow;
+  const eventWindowClosed = new Promise((resolve) => {
+    closeEventWindow = resolve;
+  });
+  let calls = 0;
+  const { service } = await createService({
+    sessionSender: async () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error("Timeout after 120000ms waiting for session.idle");
+        error.copilotEventWindowClosed = eventWindowClosed;
+        throw error;
+      }
+      return successfulToolEvents("create_session");
+    },
+  });
+  const opened = await service.open({ instanceId: "timed-out-host-action" });
+  const body = {
+    action: "create-session",
+    task: {
+      identifier: "TASK-46",
+      title: "Retain timed-out event window",
+      instruction: "Do not let later requests consume stale tool events.",
+      repository: "c00c/dashi-taskboard",
+      workspacePath: "C:\\work\\dashi-taskboard",
+    },
+  };
+
+  const first = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body,
+  });
+  assert.equal(first.response.status, 502);
+
+  const secondRequest = request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(calls, 1);
+
+  closeEventWindow();
+  assert.equal((await secondRequest).response.status, 200);
+  assert.equal(calls, 2);
+});
+
 test("Copilot host actions reject requests without the canvas capability", async () => {
   const { service } = await createService({
-    sessionSender: async () => assert.fail("unauthenticated requests must not reach Copilot"),
+    sessionSender: () => assert.fail("unauthenticated requests must not reach Copilot"),
   });
   const opened = await service.open({ instanceId: "unauthenticated-panel" });
 

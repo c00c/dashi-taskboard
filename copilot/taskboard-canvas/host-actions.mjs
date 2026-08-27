@@ -5,9 +5,48 @@ function requiredText(value, name) {
   return { value: value.trim() };
 }
 
+function requireSuccessfulToolExecution(events, expectedToolName) {
+  const startedCalls = new Set();
+  let failure;
+
+  for (const event of Array.isArray(events) ? events : []) {
+    if (
+      event?.type === "tool.execution_start"
+      && event.data?.toolName === expectedToolName
+      && typeof event.data.toolCallId === "string"
+    ) {
+      startedCalls.add(event.data.toolCallId);
+      continue;
+    }
+    if (
+      event?.type !== "tool.execution_complete"
+      || !startedCalls.has(event.data?.toolCallId)
+    ) {
+      continue;
+    }
+    if (event.data.success === true) return;
+    failure = event.data.error?.message;
+  }
+
+  throw new Error(
+    failure
+      || `Copilot did not complete the expected ${expectedToolName} host action`,
+  );
+}
+
 export function createCopilotHostActions({ sessionSender, sessionId }) {
   if (typeof sessionSender !== "function") {
     throw new Error("A Copilot session sender is required");
+  }
+  let pendingHostAction = Promise.resolve();
+
+  function sendExpectedHostAction(message, expectedToolName) {
+    const action = pendingHostAction.then(async () => {
+      const events = await sessionSender(message);
+      requireSuccessfulToolExecution(events, expectedToolName);
+    });
+    pendingHostAction = action.catch((error) => error?.copilotEventWindowClosed);
+    return action;
   }
 
   return async function handleHostAction(input) {
@@ -32,9 +71,9 @@ export function createCopilotHostActions({ sessionSender, sessionId }) {
         };
       }
       try {
-        await sessionSender({
+        await sendExpectedHostAction({
           prompt: `Use the navigate_to host API to navigate the user to the active Copilot app session '${activeSessionId}'.`,
-        });
+        }, "navigate_to");
         return { status: 200, body: { ok: true } };
       } catch {
         return {
@@ -68,9 +107,9 @@ export function createCopilotHostActions({ sessionSender, sessionId }) {
         };
       }
       try {
-        await sessionSender({
-          prompt: `Open this safe external URL for the user with the Copilot host browser API: ${url.href}`,
-        });
+        await sendExpectedHostAction({
+          prompt: `Open this safe external URL for the user in the browser canvas using the open_canvas host API with canvasId 'browser': ${url.href}`,
+        }, "open_canvas");
         return { status: 200, body: { ok: true } };
       } catch (error) {
         return {
@@ -121,9 +160,8 @@ export function createCopilotHostActions({ sessionSender, sessionId }) {
       `Workspace: ${values.workspacePath}`,
       "Start the new session with the instruction above and preserve this repository and workspace context.",
     ].join("\n");
-
     try {
-      await sessionSender({ prompt });
+      await sendExpectedHostAction({ prompt }, "create_session");
       return { status: 200, body: { ok: true } };
     } catch (error) {
       return {

@@ -4,7 +4,47 @@ import { createTaskboardCanvasService } from "./service.mjs";
 
 let sessionRef = null;
 const service = createTaskboardCanvasService({
-  sessionSender: (message) => sessionRef.sendAndWait(message, 120_000),
+  sessionSender: async (message) => {
+    const events = [];
+    let eventWindowIsClosed = false;
+    let retainEventWindow = false;
+    let closeEventWindow;
+    const eventWindowClosed = new Promise((resolve) => {
+      closeEventWindow = resolve;
+    });
+    const unsubscribe = sessionRef.on((event) => {
+      if (
+        event.type === "tool.execution_start"
+        || event.type === "tool.execution_complete"
+      ) {
+        events.push(event);
+      }
+      if (event.type === "session.idle" || event.type === "session.error") {
+        eventWindowIsClosed = true;
+        closeEventWindow();
+      }
+    });
+    try {
+      await sessionRef.sendAndWait(message, 120_000);
+      return events;
+    } catch (error) {
+      if (
+        !eventWindowIsClosed
+        && error instanceof Error
+        && /^Timeout after \d+ms waiting for session\.idle$/.test(error.message)
+      ) {
+        retainEventWindow = true;
+        error.copilotEventWindowClosed = eventWindowClosed;
+      }
+      throw error;
+    } finally {
+      if (eventWindowIsClosed || !retainEventWindow) {
+        unsubscribe();
+      } else {
+        void eventWindowClosed.then(unsubscribe);
+      }
+    }
+  },
   sessionId: process.env.SESSION_ID,
   workspacePath: () => sessionRef?.workspacePath,
 });
