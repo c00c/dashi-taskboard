@@ -148,12 +148,12 @@ test("a controlled external provider is observable through the public server API
 
   const providers = await request(baseUrl, "/api/external-work/providers");
   assert.equal(providers.response.status, 200);
-  assert.deepEqual(providers.body.providers, [{
+  assert.deepEqual(providers.body.providers.find((provider) => provider.id === "controlled"), {
     id: "controlled",
     displayName: "Controlled provider",
     connection: { configured: false, endpoint: null },
     supportedMutations: ["title", "status"],
-  }]);
+  });
 
   const connection = await request(
     baseUrl,

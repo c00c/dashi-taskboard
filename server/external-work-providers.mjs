@@ -4,7 +4,7 @@ import { TASK_STATUSES } from "../shared/domain.mjs";
 import { ApiError } from "./database.mjs";
 
 const PROVIDER_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
-const RESERVED_PROVIDER_IDS = new Set(["local", "jira"]);
+const RESERVED_PROVIDER_IDS = new Set(["local"]);
 const MUTATIONS = new Set([
   "status",
   "title",
@@ -137,6 +137,7 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
       id,
       displayName: requireString(provider.displayName, "provider.displayName", 120),
       supportedMutations,
+      managesSynchronization: provider.managesSynchronization === true,
       getConnection: (...args) => provider.getConnection(...args),
       configure: (...args) => provider.configure(...args),
       discoverProjects: (...args) => provider.discoverProjects(...args),
@@ -170,6 +171,9 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
     async list() {
       return Promise.all([...providerMap.values()].map(describe));
     },
+    async connection(providerId) {
+      return get(providerId).getConnection();
+    },
     async configure(providerId, configuration) {
       const provider = get(providerId);
       await provider.configure(configuration);
@@ -182,9 +186,16 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
       ));
       return { provider: await describe(provider), projects };
     },
-    async synchronize(providerId) {
+    async synchronize(providerId, options) {
       const provider = get(providerId);
-      const snapshot = await provider.synchronize();
+      const snapshot = await provider.synchronize(options);
+      if (provider.managesSynchronization) {
+        return {
+          provider: await describe(provider),
+          projects: snapshot?.projects ?? [],
+          tasks: snapshot?.tasks ?? [],
+        };
+      }
       const projects = (snapshot?.projects ?? []).map((project) => normalizeProject(provider.id, project));
       for (const project of projects) {
         const existing = database.getProject(project.id);
@@ -229,7 +240,7 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
           { supportedMutations: provider.supportedMutations },
         );
       }
-      await provider.mutateTask({
+      return provider.mutateTask({
         identity: {
           providerId,
           origin: task.externalOrigin,

@@ -1696,7 +1696,7 @@ export function createTaskboardServer(options = {}) {
     fetch: options.jiraFetch ?? globalThis.fetch,
   });
   const externalWorkProviders = createExternalWorkProviderRegistry({
-    providers: options.externalWorkProviders,
+    providers: [jira.provider, ...(options.externalWorkProviders ?? [])],
     database,
   });
   const externalProviderOperations = new Map();
@@ -2234,7 +2234,9 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Jira 连接接口不接受查询参数");
         }
         if (request.method === "GET") {
-          return sendJson(response, 200, { connection: await jira.status() });
+          return sendJson(response, 200, {
+            connection: await externalWorkProviders.connection("jira"),
+          });
         }
         if (request.method === "PUT") {
           const activeCloudConfig = await cloudConfig.read();
@@ -2258,14 +2260,17 @@ export function createTaskboardServer(options = {}) {
             throw new ApiError(400, "INVALID_FIELD", "'password' cannot exceed 4096 characters");
           }
           try {
-            const connection = await jira.configure({
-              baseUrl,
-              username,
-              password,
-              projects: body.projects,
-            });
+            const provider = await runExternalProviderOperation(
+              "jira",
+              () => externalWorkProviders.configure("jira", {
+                baseUrl,
+                username,
+                password,
+                projects: body.projects,
+              }),
+            );
             events.emit("project.labels.updated", { project: database.getProject(JIRA_PROJECT_ID) });
-            return sendJson(response, 200, { connection });
+            return sendJson(response, 200, { connection: provider.connection });
           } catch (error) {
             if (error instanceof ApiError) throw error;
             throw new ApiError(400, error.code ?? "INVALID_JIRA_CONFIG", error.message);
@@ -2280,9 +2285,12 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Jira 同步接口不接受查询参数");
         }
         await assertEmptyRequestBody(request, "POST /api/local/jira-connection/sync");
-        const connection = await jira.sync({ force: true });
+        const result = await runExternalProviderOperation(
+          "jira",
+          () => externalWorkProviders.synchronize("jira", { force: true }),
+        );
         events.emit("project.labels.updated", { project: database.getProject(JIRA_PROJECT_ID) });
-        return sendJson(response, 200, { connection });
+        return sendJson(response, 200, { connection: result.provider.connection });
       }
 
       const projectMappingRoute = pathname.match(/^\/api\/local\/project-mappings\/([^/]+)$/);
@@ -2738,7 +2746,12 @@ export function createTaskboardServer(options = {}) {
       if (pathname === "/api/tasks") {
         if (request.method === "GET") {
           const filters = parseTaskFilters(url.searchParams);
-          if (!filters.projectId || filters.projectId === JIRA_PROJECT_ID) await jira.sync();
+          if (!filters.projectId || filters.projectId === JIRA_PROJECT_ID) {
+            await runExternalProviderOperation(
+              "jira",
+              () => externalWorkProviders.synchronize("jira"),
+            );
+          }
           return sendJson(response, 200, { tasks: database.listTasks(filters) });
         }
         if (request.method === "POST") {
@@ -3143,10 +3156,7 @@ export function createTaskboardServer(options = {}) {
           } = resolveInputThreadBinding(parseTaskPatch(await readJson(request)));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
-          let jiraChanged = false;
-          const externalProviderId = current.source !== "local" && current.source !== "jira"
-            ? current.source
-            : null;
+          const externalProviderId = current.source !== "local" ? current.source : null;
           if (externalProviderId) {
             return await runExternalProviderOperation(externalProviderId, async () => {
               const latest = database.getTask(id);
@@ -3162,9 +3172,16 @@ export function createTaskboardServer(options = {}) {
               if (Object.hasOwn(changes, "projectId")) {
                 throw new ApiError(
                   409,
-                  "EXTERNAL_PROJECT_MOVE_UNAVAILABLE",
-                  "External tasks cannot move between Taskboard projects",
+                  externalProviderId === "jira"
+                    ? "JIRA_PROJECT_MOVE_UNAVAILABLE"
+                    : "EXTERNAL_PROJECT_MOVE_UNAVAILABLE",
+                  externalProviderId === "jira"
+                    ? "Jira 任务不能移到本地项目"
+                    : "External tasks cannot move between Taskboard projects",
                 );
+              }
+              if (externalProviderId === "jira" && assigneeTarget !== undefined) {
+                throw new ApiError(409, "JIRA_ASSIGNEE_UNAVAILABLE", "请在 Jira 中修改经办人");
               }
               const dueDate = Object.hasOwn(changes, "dueDate") ? changes.dueDate : latest.dueDate;
               const recurrence = Object.hasOwn(changes, "recurrence")
@@ -3177,16 +3194,39 @@ export function createTaskboardServer(options = {}) {
               if (assigneeTarget !== undefined) {
                 providerChanges.assignee = resolveAssignee(assigneeTarget, actor);
               }
-              await externalWorkProviders.mutateTask(externalProviderId, latest, providerChanges);
-              if (assigneeTarget !== undefined) changes.assignee = providerChanges.assignee;
-              const task = database.updateTask(
-                id,
-                version,
-                changes,
-                threadId,
-                threadBinding,
-                actor,
+              const providerChanged = await externalWorkProviders.mutateTask(
+                externalProviderId,
+                latest,
+                providerChanges,
               );
+              if (assigneeTarget !== undefined) changes.assignee = providerChanges.assignee;
+              let task;
+              try {
+                task = database.updateTask(
+                  id,
+                  version,
+                  changes,
+                  threadId,
+                  threadBinding,
+                  actor,
+                );
+              } catch (error) {
+                if (externalProviderId === "jira" && providerChanged) {
+                  try {
+                    await externalWorkProviders.synchronize("jira", {
+                      force: true,
+                      archiveMissing: false,
+                    });
+                  } catch {
+                    throw new ApiError(
+                      502,
+                      "JIRA_RECONCILE_FAILED",
+                      "Jira 已更新，但 Taskboard 重新同步失败，请手动同步",
+                    );
+                  }
+                }
+                throw error;
+              }
               events.emit("task.updated", { task });
               return sendJson(response, 200, { task });
             });
@@ -3198,51 +3238,10 @@ export function createTaskboardServer(options = {}) {
               "本地任务不能移入 Jira 同步项目",
             );
           }
-          if (current.source === "jira") {
-            if (current.version !== version) {
-              throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
-                expectedVersion: version,
-                actualVersion: current.version,
-              });
-            }
-            if (current.archivedAt !== null) {
-              throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be updated");
-            }
-            if (Object.hasOwn(changes, "projectId")) {
-              throw new ApiError(409, "JIRA_PROJECT_MOVE_UNAVAILABLE", "Jira 任务不能移到本地项目");
-            }
-            if (assigneeTarget !== undefined) {
-              throw new ApiError(409, "JIRA_ASSIGNEE_UNAVAILABLE", "请在 Jira 中修改经办人");
-            }
-            const dueDate = Object.hasOwn(changes, "dueDate") ? changes.dueDate : current.dueDate;
-            const recurrence = Object.hasOwn(changes, "recurrence")
-              ? changes.recurrence
-              : current.recurrence;
-            if (recurrence && !dueDate) {
-              throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires a due date");
-            }
-            jiraChanged = await jira.updateTask(current, changes);
-          }
           if (assigneeTarget !== undefined) {
             changes.assignee = resolveAssignee(assigneeTarget, actor);
           }
-          let task;
-          try {
-            task = database.updateTask(id, version, changes, threadId, threadBinding, actor);
-          } catch (error) {
-            if (jiraChanged) {
-              try {
-                await jira.reconcile();
-              } catch {
-                throw new ApiError(
-                  502,
-                  "JIRA_RECONCILE_FAILED",
-                  "Jira 已更新，但 Taskboard 重新同步失败，请手动同步",
-                );
-              }
-            }
-            throw error;
-          }
+          const task = database.updateTask(id, version, changes, threadId, threadBinding, actor);
           events.emit("task.updated", { task });
           return sendJson(response, 200, { task });
         }
@@ -3274,19 +3273,7 @@ export function createTaskboardServer(options = {}) {
           const move = resolveInputThreadBinding(parseMove(await readJson(request)));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
-          if (current.source === "jira") {
-            if (current.version !== move.version) {
-              throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
-                expectedVersion: move.version,
-                actualVersion: current.version,
-              });
-            }
-            if (current.archivedAt !== null) {
-              throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
-            }
-            await jira.moveTask(current, move.status);
-          }
-          if (current.source !== "local" && current.source !== "jira") {
+          if (current.source !== "local") {
             return await runExternalProviderOperation(current.source, async () => {
               const latest = database.getTask(id);
               if (latest.version !== move.version) {
