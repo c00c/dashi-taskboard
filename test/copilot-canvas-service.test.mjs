@@ -37,7 +37,57 @@ function controlledSessionSender(events, sent = []) {
   return async (message) => {
     sent.push(message);
     if (events instanceof Error) throw events;
-    return events;
+    return controlledSdkResult(message, events);
+  };
+}
+
+function toolArgumentsFromPrompt(message) {
+  return JSON.parse(message.prompt.slice(message.prompt.indexOf("{")));
+}
+
+function controlledSdkResult(message, events) {
+  const expectedArguments = toolArgumentsFromPrompt(message);
+  const hasTurn = events.some((event) => event.type === "assistant.turn_start");
+  return {
+    messageId: "host-action-message",
+    events: [
+      ...(hasTurn
+        ? []
+        : [
+          {
+            type: "user.message",
+            id: "host-action-message",
+            data: { interactionId: "host-action-interaction" },
+          },
+          {
+            type: "assistant.turn_start",
+            data: {
+              interactionId: "host-action-interaction",
+              turnId: "host-action-turn",
+            },
+          },
+        ]),
+      ...events.map((event) => (
+        event.type === "tool.execution_start"
+          ? {
+            ...event,
+            data: {
+              arguments: expectedArguments,
+              turnId: "host-action-turn",
+              ...event.data,
+            },
+          }
+          : event.type === "tool.execution_complete"
+            ? {
+              ...event,
+              data: {
+                turnId: "host-action-turn",
+                ...event.data,
+              },
+            }
+            : event
+      )),
+    ],
   };
 }
 
@@ -50,6 +100,40 @@ function successfulToolEvents(toolName) {
     {
       type: "tool.execution_complete",
       data: { toolCallId: "host-action-call", success: true },
+    },
+  ];
+}
+
+function mismatchedCreateSessionEvents({ turnId, arguments: toolArguments }) {
+  return [
+    {
+      type: "user.message",
+      id: "host-action-message",
+      data: { interactionId: "host-action-interaction" },
+    },
+    {
+      type: "assistant.turn_start",
+      data: {
+        interactionId: "host-action-interaction",
+        turnId: "host-action-turn",
+      },
+    },
+    {
+      type: "tool.execution_start",
+      data: {
+        arguments: toolArguments,
+        toolCallId: "unrelated-call",
+        toolName: "create_session",
+        turnId,
+      },
+    },
+    {
+      type: "tool.execution_complete",
+      data: {
+        success: true,
+        toolCallId: "unrelated-call",
+        turnId,
+      },
     },
   ];
 }
@@ -79,11 +163,19 @@ test("Copilot canvas creates a coding session with the task and workspace contex
   assert.equal(result.response.status, 200);
   assert.deepEqual(result.body, { ok: true });
   assert.equal(sent.length, 1);
-  assert.match(sent[0].prompt, /TASK-42/);
-  assert.match(sent[0].prompt, /Add Copilot host actions/);
-  assert.match(sent[0].prompt, /Implement the settled ticket\./);
-  assert.match(sent[0].prompt, /c00c\/dashi-taskboard/);
-  assert.match(sent[0].prompt, /C:\\work\\dashi-taskboard/);
+  assert.deepEqual(toolArgumentsFromPrompt(sent[0]), {
+    kickoff: {
+      mode: "autopilot",
+      prompt: [
+        "Taskboard issue: TASK-42 - Add Copilot host actions",
+        "Instruction: Implement the settled ticket.",
+        "Repository: c00c/dashi-taskboard",
+        "Workspace context: C:\\work\\dashi-taskboard",
+      ].join("\n"),
+    },
+    name: "Add Copilot host actions",
+    workspace_type: "worktree",
+  });
 });
 
 test("Copilot canvas jumps back to its active app session", async () => {
@@ -213,16 +305,248 @@ for (const failure of [
   });
 }
 
+test("Copilot host action rejects mixed root tool calls in its turn", async () => {
+  const events = [
+    {
+      type: "tool.execution_start",
+      data: {
+        arguments: { id: "unrelated-session" },
+        toolCallId: "unrelated-call",
+        toolName: "navigate_to",
+      },
+    },
+    {
+      type: "tool.execution_complete",
+      data: {
+        success: true,
+        toolCallId: "unrelated-call",
+      },
+    },
+    ...successfulToolEvents("create_session"),
+  ];
+  const { service } = await createService({
+    sessionSender: controlledSessionSender(events),
+  });
+  const opened = await service.open({ instanceId: "mixed-root-tool-calls" });
+
+  const result = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: {
+      action: "create-session",
+      task: {
+        identifier: "TASK-52",
+        title: "Require one exact host call",
+        instruction: "Create only the requested Taskboard session.",
+        repository: "c00c/dashi-taskboard",
+        workspacePath: "C:\\work\\dashi-taskboard",
+      },
+    },
+  });
+
+  assert.equal(result.response.status, 502);
+  assert.equal(result.body.error.code, "COPILOT_HOST_ACTION_FAILED");
+});
+
+test("Copilot host action rejects a same-named tool success from another turn", async () => {
+  const { service } = await createService({
+    sessionSender: controlledSessionSender(
+      mismatchedCreateSessionEvents({
+        turnId: "unrelated-turn",
+        arguments: {
+          name: "Require exact host action correlation",
+          kickoff: { prompt: "Create the requested Taskboard session." },
+        },
+      }),
+    ),
+  });
+  const opened = await service.open({ instanceId: "wrong-turn-host-action" });
+
+  const result = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: {
+      action: "create-session",
+      task: {
+        identifier: "TASK-47",
+        title: "Require exact host action correlation",
+        instruction: "Create the requested Taskboard session.",
+        repository: "c00c/dashi-taskboard",
+        workspacePath: "C:\\work\\dashi-taskboard",
+      },
+    },
+  });
+
+  assert.equal(result.response.status, 502);
+  assert.equal(result.body.error.code, "COPILOT_HOST_ACTION_FAILED");
+});
+
+test("Copilot host action rejects a subagent user-message anchor", async () => {
+  const events = mismatchedCreateSessionEvents({
+    turnId: "host-action-turn",
+    arguments: {
+      kickoff: {
+        mode: "autopilot",
+        prompt: [
+          "Taskboard issue: TASK-51 - Require a root message anchor",
+          "Instruction: Create the requested root session.",
+          "Repository: c00c/dashi-taskboard",
+          "Workspace context: C:\\work\\dashi-taskboard",
+        ].join("\n"),
+      },
+      name: "Require a root message anchor",
+      workspace_type: "worktree",
+    },
+  });
+  events[0].agentId = "subagent";
+  const { service } = await createService({
+    sessionSender: controlledSessionSender(events),
+  });
+  const opened = await service.open({ instanceId: "subagent-message-anchor" });
+
+  const result = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: {
+      action: "create-session",
+      task: {
+        identifier: "TASK-51",
+        title: "Require a root message anchor",
+        instruction: "Create the requested root session.",
+        repository: "c00c/dashi-taskboard",
+        workspacePath: "C:\\work\\dashi-taskboard",
+      },
+    },
+  });
+
+  assert.equal(result.response.status, 502);
+  assert.equal(result.body.error.code, "COPILOT_HOST_ACTION_FAILED");
+});
+
+test("Copilot host action rejects the expected tool with wrong arguments", async () => {
+  const { service } = await createService({
+    sessionSender: controlledSessionSender(
+      mismatchedCreateSessionEvents({
+        turnId: "host-action-turn",
+        arguments: {
+          name: "Unrelated task",
+          kickoff: { prompt: "Create a different session." },
+        },
+      }),
+    ),
+  });
+  const opened = await service.open({ instanceId: "wrong-arguments-host-action" });
+
+  const result = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: {
+      action: "create-session",
+      task: {
+        identifier: "TASK-48",
+        title: "Require expected host arguments",
+        instruction: "Create only this Taskboard session.",
+        repository: "c00c/dashi-taskboard",
+        workspacePath: "C:\\work\\dashi-taskboard",
+      },
+    },
+  });
+
+  assert.equal(result.response.status, 502);
+  assert.equal(result.body.error.code, "COPILOT_HOST_ACTION_FAILED");
+});
+
+test("Copilot host action rejects behavior-changing extra tool arguments", async () => {
+  const sessionPrompt = [
+    "Taskboard issue: TASK-50 - Reject extra host arguments",
+    "Instruction: Create the requested Taskboard session.",
+    "Repository: c00c/dashi-taskboard",
+    "Workspace context: C:\\work\\dashi-taskboard",
+  ].join("\n");
+  const { service } = await createService({
+    sessionSender: controlledSessionSender(
+      mismatchedCreateSessionEvents({
+        turnId: "host-action-turn",
+        arguments: {
+          kickoff: {
+            mode: "autopilot",
+            prompt: sessionPrompt,
+          },
+          name: "Reject extra host arguments",
+          project_id: "unrelated-project",
+          workspace_type: "worktree",
+        },
+      }),
+    ),
+  });
+  const opened = await service.open({ instanceId: "extra-arguments-host-action" });
+
+  const result = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body: {
+      action: "create-session",
+      task: {
+        identifier: "TASK-50",
+        title: "Reject extra host arguments",
+        instruction: "Create the requested Taskboard session.",
+        repository: "c00c/dashi-taskboard",
+        workspacePath: "C:\\work\\dashi-taskboard",
+      },
+    },
+  });
+
+  assert.equal(result.response.status, 502);
+  assert.equal(result.body.error.code, "COPILOT_HOST_ACTION_FAILED");
+});
+
+test("stale tool events cannot satisfy a later Copilot host action", async () => {
+  let calls = 0;
+  const staleEvents = mismatchedCreateSessionEvents({
+    turnId: "stale-turn",
+    arguments: {
+      name: "Require stale event isolation",
+      kickoff: { prompt: "Create only the current session." },
+    },
+  });
+  const { service } = await createService({
+    sessionSender: async (message) => {
+      calls += 1;
+      return controlledSdkResult(message, calls === 1 ? [] : staleEvents);
+    },
+  });
+  const opened = await service.open({ instanceId: "stale-host-action" });
+  const body = {
+    action: "create-session",
+    task: {
+      identifier: "TASK-49",
+      title: "Require stale event isolation",
+      instruction: "Create only the current session.",
+      repository: "c00c/dashi-taskboard",
+      workspacePath: "C:\\work\\dashi-taskboard",
+    },
+  };
+
+  const first = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body,
+  });
+  const second = await request(opened.url, "/api/copilot-host-actions", {
+    method: "POST",
+    body,
+  });
+
+  assert.deepEqual(
+    [first.response.status, second.response.status],
+    [502, 502],
+  );
+});
+
 test("concurrent Copilot host actions use separate session event windows", async () => {
   let inFlight = 0;
   let maximumInFlight = 0;
   const { service } = await createService({
-    sessionSender: async () => {
+    sessionSender: async (message) => {
       inFlight += 1;
       maximumInFlight = Math.max(maximumInFlight, inFlight);
       await new Promise((resolve) => setTimeout(resolve, 20));
       inFlight -= 1;
-      return successfulToolEvents("create_session");
+      return controlledSdkResult(message, successfulToolEvents("create_session"));
     },
   });
   const opened = await service.open({ instanceId: "concurrent-host-actions" });
@@ -253,14 +577,14 @@ test("a timed-out host action retains its session event window until idle", asyn
   });
   let calls = 0;
   const { service } = await createService({
-    sessionSender: async () => {
+    sessionSender: async (message) => {
       calls += 1;
       if (calls === 1) {
         const error = new Error("Timeout after 120000ms waiting for session.idle");
         error.copilotEventWindowClosed = eventWindowClosed;
         throw error;
       }
-      return successfulToolEvents("create_session");
+      return controlledSdkResult(message, successfulToolEvents("create_session"));
     },
   });
   const opened = await service.open({ instanceId: "timed-out-host-action" });

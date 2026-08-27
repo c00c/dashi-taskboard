@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+
 function requiredText(value, name) {
   if (typeof value !== "string" || value.trim().length === 0) {
     return { error: `${name} is required` };
@@ -5,33 +8,138 @@ function requiredText(value, name) {
   return { value: value.trim() };
 }
 
-function requireSuccessfulToolExecution(events, expectedToolName) {
-  const startedCalls = new Set();
-  let failure;
+function hasExactKeys(value, expectedKeys) {
+  return isDeepStrictEqual(
+    Object.keys(value).sort(),
+    [...expectedKeys].sort(),
+  );
+}
 
-  for (const event of Array.isArray(events) ? events : []) {
+function normalizedToolArguments(toolName, toolArguments) {
+  if (!toolArguments || typeof toolArguments !== "object" || Array.isArray(toolArguments)) {
+    return null;
+  }
+  if (toolName === "navigate_to") {
+    return hasExactKeys(toolArguments, ["id"]) && typeof toolArguments.id === "string"
+      ? { id: toolArguments.id.trim() }
+      : null;
+  }
+  if (toolName === "open_canvas") {
     if (
-      event?.type === "tool.execution_start"
-      && event.data?.toolName === expectedToolName
-      && typeof event.data.toolCallId === "string"
+      !hasExactKeys(toolArguments, ["canvasId", "input", "instanceId"])
+      || toolArguments.canvasId !== "browser"
+      || typeof toolArguments.instanceId !== "string"
+      || !toolArguments.input
+      || typeof toolArguments.input !== "object"
+      || Array.isArray(toolArguments.input)
+      || !hasExactKeys(toolArguments.input, ["url"])
+      || typeof toolArguments.input.url !== "string"
     ) {
-      startedCalls.add(event.data.toolCallId);
-      continue;
+      return null;
     }
+    try {
+      return {
+        canvasId: "browser",
+        input: { url: new URL(toolArguments.input.url).href },
+        instanceId: toolArguments.instanceId.trim(),
+      };
+    } catch {
+      return null;
+    }
+  }
+  if (toolName === "create_session") {
+    const kickoff = toolArguments.kickoff;
     if (
-      event?.type !== "tool.execution_complete"
-      || !startedCalls.has(event.data?.toolCallId)
+      !hasExactKeys(toolArguments, ["kickoff", "name", "workspace_type"])
+      || typeof toolArguments.name !== "string"
+      || toolArguments.workspace_type !== "worktree"
+      || !kickoff
+      || typeof kickoff !== "object"
+      || Array.isArray(kickoff)
+      || !hasExactKeys(kickoff, ["mode", "prompt"])
+      || typeof kickoff.prompt !== "string"
+      || kickoff.mode !== "autopilot"
     ) {
-      continue;
+      return null;
     }
-    if (event.data.success === true) return;
-    failure = event.data.error?.message;
+    return {
+      kickoff: {
+        mode: "autopilot",
+        prompt: kickoff.prompt.trim(),
+      },
+      name: toolArguments.name.trim(),
+      workspace_type: "worktree",
+    };
+  }
+  return null;
+}
+
+function requireSuccessfulToolExecution(
+  result,
+  expectedToolName,
+  expectedToolArguments,
+) {
+  const events = Array.isArray(result?.events) ? result.events : [];
+  const messageId = result?.messageId;
+  const userMessage = events.find((event) => (
+    event?.type === "user.message"
+    && event.agentId === undefined
+    && event.id === messageId
+    && typeof event.data?.interactionId === "string"
+    && event.data.interactionId.length > 0
+  ));
+  const matchingTurns = userMessage
+    ? events.filter((event) => (
+      event?.type === "assistant.turn_start"
+      && event.agentId === undefined
+      && event.data?.interactionId === userMessage.data.interactionId
+      && typeof event.data.turnId === "string"
+      && event.data.turnId.length > 0
+    ))
+    : [];
+  if (matchingTurns.length !== 1) {
+    throw new Error(
+      `Copilot did not identify the exact turn for the expected ${expectedToolName} host action`,
+    );
   }
 
-  throw new Error(
-    failure
-      || `Copilot did not complete the expected ${expectedToolName} host action`,
-  );
+  const expectedTurnId = matchingTurns[0].data.turnId;
+  const starts = events.filter((event) => (
+    event?.type === "tool.execution_start"
+    && event.agentId === undefined
+    && event.data?.turnId === expectedTurnId
+  ));
+  if (
+    starts.length !== 1
+    || starts[0].data?.toolName !== expectedToolName
+    || typeof starts[0].data.toolCallId !== "string"
+    || !isDeepStrictEqual(
+      normalizedToolArguments(expectedToolName, starts[0].data.arguments),
+      expectedToolArguments,
+    )
+  ) {
+    throw new Error(
+      `Copilot did not complete the expected ${expectedToolName} host action`,
+    );
+  }
+
+  const completions = events.filter((event) => (
+    event?.type === "tool.execution_complete"
+    && event.agentId === undefined
+    && event.data?.turnId === expectedTurnId
+  ));
+  if (
+    completions.length !== 1
+    || completions[0].data?.toolCallId !== starts[0].data.toolCallId
+    || completions[0].data.success !== true
+  ) {
+    throw new Error(
+      completions.length === 1
+        ? completions[0].data?.error?.message
+          || `Copilot did not complete the expected ${expectedToolName} host action`
+        : `Copilot did not complete the expected ${expectedToolName} host action`,
+    );
+  }
 }
 
 export function createCopilotHostActions({ sessionSender, sessionId }) {
@@ -40,10 +148,14 @@ export function createCopilotHostActions({ sessionSender, sessionId }) {
   }
   let pendingHostAction = Promise.resolve();
 
-  function sendExpectedHostAction(message, expectedToolName) {
+  function sendExpectedHostAction(message, expectedToolName, expectedToolArguments) {
     const action = pendingHostAction.then(async () => {
-      const events = await sessionSender(message);
-      requireSuccessfulToolExecution(events, expectedToolName);
+      const result = await sessionSender(message);
+      requireSuccessfulToolExecution(
+        result,
+        expectedToolName,
+        expectedToolArguments,
+      );
     });
     pendingHostAction = action.catch((error) => error?.copilotEventWindowClosed);
     return action;
@@ -71,9 +183,10 @@ export function createCopilotHostActions({ sessionSender, sessionId }) {
         };
       }
       try {
+        const expectedArguments = { id: activeSessionId.trim() };
         await sendExpectedHostAction({
-          prompt: `Use the navigate_to host API to navigate the user to the active Copilot app session '${activeSessionId}'.`,
-        }, "navigate_to");
+          prompt: `Call navigate_to exactly once with these arguments and do not call another tool: ${JSON.stringify(expectedArguments)}`,
+        }, "navigate_to", expectedArguments);
         return { status: 200, body: { ok: true } };
       } catch {
         return {
@@ -107,9 +220,14 @@ export function createCopilotHostActions({ sessionSender, sessionId }) {
         };
       }
       try {
+        const expectedArguments = {
+          canvasId: "browser",
+          input: { url: url.href },
+          instanceId: `taskboard-external-link-${randomUUID()}`,
+        };
         await sendExpectedHostAction({
-          prompt: `Open this safe external URL for the user in the browser canvas using the open_canvas host API with canvasId 'browser': ${url.href}`,
-        }, "open_canvas");
+          prompt: `Call open_canvas exactly once with these arguments and do not call another tool: ${JSON.stringify(expectedArguments)}`,
+        }, "open_canvas", expectedArguments);
         return { status: 200, body: { ok: true } };
       } catch (error) {
         return {
@@ -151,17 +269,27 @@ export function createCopilotHostActions({ sessionSender, sessionId }) {
       values[field] = parsed.value;
     }
 
-    const prompt = [
-      "Create a coding session for this Taskboard issue using the create_session host API.",
-      `Identifier: ${values.identifier}`,
-      `Title: ${values.title}`,
+    const sessionPrompt = [
+      `Taskboard issue: ${values.identifier} - ${values.title}`,
       `Instruction: ${values.instruction}`,
       `Repository: ${values.repository}`,
-      `Workspace: ${values.workspacePath}`,
-      "Start the new session with the instruction above and preserve this repository and workspace context.",
+      `Workspace context: ${values.workspacePath}`,
     ].join("\n");
+    const expectedArguments = {
+      kickoff: {
+        mode: "autopilot",
+        prompt: sessionPrompt,
+      },
+      name: values.title,
+      workspace_type: "worktree",
+    };
+    const prompt = `Call create_session exactly once with these arguments and do not call another tool: ${JSON.stringify(expectedArguments)}`;
     try {
-      await sendExpectedHostAction({ prompt }, "create_session");
+      await sendExpectedHostAction(
+        { prompt },
+        "create_session",
+        expectedArguments,
+      );
       return { status: 200, body: { ok: true } };
     } catch (error) {
       return {
