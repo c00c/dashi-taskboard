@@ -29,6 +29,7 @@ import {
   isLocalCompanionRoute,
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
+import { createExternalWorkProviderRegistry } from "./external-work-providers.mjs";
 import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
@@ -1694,6 +1695,23 @@ export function createTaskboardServer(options = {}) {
     database,
     fetch: options.jiraFetch ?? globalThis.fetch,
   });
+  const externalWorkProviders = createExternalWorkProviderRegistry({
+    providers: options.externalWorkProviders,
+    database,
+  });
+  const externalProviderOperations = new Map();
+  async function runExternalProviderOperation(providerId, callback) {
+    const previous = externalProviderOperations.get(providerId) ?? Promise.resolve();
+    const operation = previous.catch(() => {}).then(callback);
+    externalProviderOperations.set(providerId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (externalProviderOperations.get(providerId) === operation) {
+        externalProviderOperations.delete(providerId);
+      }
+    }
+  }
   let hostRuntime = null;
   function currentHostThreadBinding(threadId) {
     if (
@@ -2481,6 +2499,48 @@ export function createTaskboardServer(options = {}) {
         }
       }
 
+      if (pathname === "/api/external-work/providers") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/external-work/providers");
+        return sendJson(response, 200, { providers: await externalWorkProviders.list() });
+      }
+
+      const externalProviderRoute = pathname.match(
+        /^\/api\/external-work\/providers\/([^/]+)\/(connection|projects|sync)$/,
+      );
+      if (externalProviderRoute) {
+        const providerId = decodeRouteSegment(externalProviderRoute[1], "providerId");
+        const action = externalProviderRoute[2];
+        assertNoQuery(url.searchParams, `${request.method} ${pathname}`);
+        if (action === "connection") {
+          if (request.method !== "PUT") return methodNotAllowed(response, ["PUT"]);
+          const configuration = await readJson(request);
+          assertPlainObject(configuration);
+          return sendJson(response, 200, {
+            provider: await runExternalProviderOperation(
+              providerId,
+              () => externalWorkProviders.configure(providerId, configuration),
+            ),
+          });
+        }
+        if (action === "projects") {
+          if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+          return sendJson(response, 200, await externalWorkProviders.discover(providerId));
+        }
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        await assertEmptyRequestBody(request, `POST ${pathname}`);
+        const result = await runExternalProviderOperation(
+          providerId,
+          () => externalWorkProviders.synchronize(providerId),
+        );
+        events.emit("external-work.synced", {
+          providerId,
+          projectIds: result.projects.map((project) => project.id),
+          taskIds: result.tasks.map((task) => task.id),
+        });
+        return sendJson(response, 200, result);
+      }
+
       if (pathname === "/api/projects") {
         if (request.method === "GET") {
           if ([...url.searchParams.keys()].length > 0) {
@@ -2690,6 +2750,14 @@ export function createTaskboardServer(options = {}) {
               409,
               "JIRA_CREATE_UNAVAILABLE",
               "请在 Jira 中新建议题，Taskboard 当前只同步已分配给你的任务",
+            );
+          }
+          const targetProject = database.getProject(input.projectId);
+          if (targetProject && targetProject.source !== "local") {
+            throw new ApiError(
+              409,
+              "EXTERNAL_CREATE_UNAVAILABLE",
+              `Provider '${targetProject.source}' does not support creating tasks`,
             );
           }
           const task = database.createTask({
@@ -3076,6 +3144,53 @@ export function createTaskboardServer(options = {}) {
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
           let jiraChanged = false;
+          const externalProviderId = current.source !== "local" && current.source !== "jira"
+            ? current.source
+            : null;
+          if (externalProviderId) {
+            return await runExternalProviderOperation(externalProviderId, async () => {
+              const latest = database.getTask(id);
+              if (latest.version !== version) {
+                throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
+                  expectedVersion: version,
+                  actualVersion: latest.version,
+                });
+              }
+              if (latest.archivedAt !== null) {
+                throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be updated");
+              }
+              if (Object.hasOwn(changes, "projectId")) {
+                throw new ApiError(
+                  409,
+                  "EXTERNAL_PROJECT_MOVE_UNAVAILABLE",
+                  "External tasks cannot move between Taskboard projects",
+                );
+              }
+              const dueDate = Object.hasOwn(changes, "dueDate") ? changes.dueDate : latest.dueDate;
+              const recurrence = Object.hasOwn(changes, "recurrence")
+                ? changes.recurrence
+                : latest.recurrence;
+              if (recurrence && !dueDate) {
+                throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires a due date");
+              }
+              const providerChanges = { ...changes };
+              if (assigneeTarget !== undefined) {
+                providerChanges.assignee = resolveAssignee(assigneeTarget, actor);
+              }
+              await externalWorkProviders.mutateTask(externalProviderId, latest, providerChanges);
+              if (assigneeTarget !== undefined) changes.assignee = providerChanges.assignee;
+              const task = database.updateTask(
+                id,
+                version,
+                changes,
+                threadId,
+                threadBinding,
+                actor,
+              );
+              events.emit("task.updated", { task });
+              return sendJson(response, 200, { task });
+            });
+          }
           if (current.source !== "jira" && changes.projectId === JIRA_PROJECT_ID) {
             throw new ApiError(
               409,
@@ -3136,6 +3251,13 @@ export function createTaskboardServer(options = {}) {
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_DELETE_UNAVAILABLE", "Jira 任务不能从 Taskboard 永久删除");
           }
+          if (current && current.source !== "local") {
+            throw new ApiError(
+              409,
+              "EXTERNAL_DELETE_UNAVAILABLE",
+              "External tasks cannot be permanently deleted from Taskboard",
+            );
+          }
           const { version } = parseArchive(await readJson(request));
           const deleted = database.deleteArchivedTask(id, version);
           for (const attachmentId of deleted.attachmentIds) {
@@ -3164,6 +3286,38 @@ export function createTaskboardServer(options = {}) {
             }
             await jira.moveTask(current, move.status);
           }
+          if (current.source !== "local" && current.source !== "jira") {
+            return await runExternalProviderOperation(current.source, async () => {
+              const latest = database.getTask(id);
+              if (latest.version !== move.version) {
+                throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
+                  expectedVersion: move.version,
+                  actualVersion: latest.version,
+                });
+              }
+              if (latest.archivedAt !== null) {
+                throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
+              }
+              if (move.status !== latest.status) {
+                await externalWorkProviders.mutateTask(
+                  latest.source,
+                  latest,
+                  { status: move.status },
+                );
+              }
+              const task = database.moveTask(
+                id,
+                move.version,
+                move.status,
+                move.sortOrder,
+                move.threadId,
+                move.threadBinding,
+                actorFromRequest(request),
+              );
+              events.emit("task.moved", { task });
+              return sendJson(response, 200, { task });
+            });
+          }
           const task = database.moveTask(
             id,
             move.version,
@@ -3180,6 +3334,13 @@ export function createTaskboardServer(options = {}) {
           const current = database.getTask(id);
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_ARCHIVE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动归档");
+          }
+          if (current && current.source !== "local") {
+            throw new ApiError(
+              409,
+              "EXTERNAL_ARCHIVE_UNAVAILABLE",
+              "External tasks are archived by provider synchronization",
+            );
           }
           const { version, threadId, threadBinding } = resolveInputThreadBinding(
             parseArchive(await readJson(request)),
@@ -3198,6 +3359,13 @@ export function createTaskboardServer(options = {}) {
           const current = database.getTask(id);
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_RESTORE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动恢复");
+          }
+          if (current && current.source !== "local") {
+            throw new ApiError(
+              409,
+              "EXTERNAL_RESTORE_UNAVAILABLE",
+              "External tasks are restored by provider synchronization",
+            );
           }
           const { version, threadId, threadBinding } = resolveInputThreadBinding(
             parseArchive(await readJson(request)),
