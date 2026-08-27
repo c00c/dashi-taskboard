@@ -282,3 +282,196 @@ test("a controlled external provider is observable through the public server API
   assert.equal(failedSync.response.status, 502);
   assert.equal(failedSync.body.error.code, "CONTROLLED_SYNC_FAILED");
 });
+
+function createAuthoritativeProvider() {
+  const state = {
+    configured: false,
+    remoteStatus: "active",
+    commentBody: "Remote comment first revision",
+    mutations: [],
+  };
+  const buildSnapshot = () => ({
+    projects: [{
+      id: "authoritative-project",
+      name: "Authoritative project",
+      labels: [],
+      externalOrigin: "tenant-9",
+      externalId: "project-9",
+      externalUrl: "https://authoritative.example.test/projects/9",
+    }],
+    tasks: [{
+      projectId: "authoritative-project",
+      title: "Authoritative task",
+      description: "Owned by the remote system",
+      remoteStatus: state.remoteStatus,
+      priority: "medium",
+      labels: [],
+      externalOrigin: "tenant-9",
+      externalId: "work-item-77",
+      externalKey: "AUTH-77",
+      externalUrl: "https://authoritative.example.test/items/77",
+      creator: { id: "remote-user", name: "Remote user" },
+      assignee: { id: "remote-user", name: "Remote user" },
+      createdAt: "2026-08-26T00:00:00.000Z",
+      updatedAt: "2026-08-26T00:00:00.000Z",
+    }],
+    comments: [{
+      id: "remote-comment-1",
+      externalOrigin: "tenant-9",
+      externalId: "work-item-77",
+      body: state.commentBody,
+      actor: { id: "remote-user", name: "Remote user" },
+      createdAt: "2026-08-26T00:00:00.000Z",
+    }],
+  });
+  return {
+    state,
+    provider: {
+      id: "authoritative",
+      displayName: "Authoritative provider",
+      supportedMutations: ["status", "assignee"],
+      authoritativeMutations: true,
+      async getConnection() {
+        return { configured: state.configured, endpoint: "https://authoritative.example.test" };
+      },
+      async configure() {
+        state.configured = true;
+      },
+      async discoverProjects() {
+        return buildSnapshot().projects;
+      },
+      async synchronize() {
+        return buildSnapshot();
+      },
+      mapStatus(remoteStatus) {
+        if (remoteStatus === "active") return "todo";
+        if (remoteStatus === "committed") return "in_progress";
+        return "done";
+      },
+      async mutateTask(mutation) {
+        state.mutations.push(mutation);
+        if (mutation.changes.status === "in_progress") state.remoteStatus = "committed";
+        if (mutation.changes.status === "done") state.remoteStatus = "closed";
+        return { snapshot: buildSnapshot() };
+      },
+    },
+  };
+}
+
+async function syncAuthoritativeTask(baseUrl) {
+  await request(baseUrl, "/api/external-work/providers/authoritative/connection", {
+    method: "PUT",
+    body: { endpoint: "https://authoritative.example.test" },
+  });
+  const synchronization = await request(
+    baseUrl,
+    "/api/external-work/providers/authoritative/sync",
+    { method: "POST" },
+  );
+  assert.equal(synchronization.response.status, 200);
+  return synchronization.body.tasks[0];
+}
+
+test("an authoritative external move persists the local thread binding", async () => {
+  const authoritative = createAuthoritativeProvider();
+  const baseUrl = await startServer(authoritative.provider);
+  const task = await syncAuthoritativeTask(baseUrl);
+  assert.equal(task.status, "todo");
+
+  const moved = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}/move`, {
+    method: "POST",
+    body: {
+      version: task.version,
+      status: "in_progress",
+      threadId: "thread-move-1",
+      threadBinding: {
+        threadId: "thread-move-1",
+        codexProjectId: "codex-project-1",
+        codexProjectKind: "local",
+        codexHostId: "local",
+        workspacePath: "/workspace/authoritative",
+      },
+    },
+  });
+  assert.equal(moved.response.status, 200, JSON.stringify(moved.body));
+  assert.equal(moved.body.task.status, "in_progress");
+  assert.equal(moved.body.task.threadId, "thread-move-1");
+  assert.deepEqual(moved.body.task.threadBinding, {
+    threadId: "thread-move-1",
+    codexProjectId: "codex-project-1",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/workspace/authoritative",
+  });
+
+  const reread = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`);
+  assert.equal(reread.body.task.threadId, "thread-move-1");
+  assert.equal(reread.body.task.threadBinding.workspacePath, "/workspace/authoritative");
+});
+
+test("an authoritative remote-only patch persists the local thread binding", async () => {
+  const authoritative = createAuthoritativeProvider();
+  const baseUrl = await startServer(authoritative.provider);
+  const task = await syncAuthoritativeTask(baseUrl);
+
+  const patched = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`, {
+    method: "PATCH",
+    body: {
+      version: task.version,
+      status: "in_progress",
+      threadId: "thread-patch-1",
+      threadBinding: {
+        threadId: "thread-patch-1",
+        codexProjectId: "codex-project-2",
+        codexProjectKind: "local",
+        codexHostId: "local",
+        workspacePath: "/workspace/authoritative-patch",
+      },
+    },
+  });
+  assert.equal(patched.response.status, 200, JSON.stringify(patched.body));
+  assert.equal(patched.body.task.status, "in_progress");
+  assert.equal(patched.body.task.threadId, "thread-patch-1");
+  assert.deepEqual(patched.body.task.threadBinding, {
+    threadId: "thread-patch-1",
+    codexProjectId: "codex-project-2",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/workspace/authoritative-patch",
+  });
+
+  const reread = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}`);
+  assert.equal(reread.body.task.threadId, "thread-patch-1");
+  assert.equal(reread.body.task.threadBinding.workspacePath, "/workspace/authoritative-patch");
+});
+
+test("synchronized external comments converge without duplicating on re-sync", async () => {
+  const authoritative = createAuthoritativeProvider();
+  const baseUrl = await startServer(authoritative.provider);
+  const task = await syncAuthoritativeTask(baseUrl);
+
+  const first = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}/comments`);
+  assert.deepEqual(
+    first.body.comments.map((comment) => comment.body),
+    ["Remote comment first revision"],
+  );
+  const commentId = first.body.comments[0].id;
+  const commentVersion = first.body.comments[0].version;
+
+  await request(baseUrl, "/api/external-work/providers/authoritative/sync", { method: "POST" });
+  const unchanged = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}/comments`);
+  assert.equal(unchanged.body.comments.length, 1);
+  assert.equal(unchanged.body.comments[0].version, commentVersion);
+
+  authoritative.state.commentBody = "Remote comment second revision";
+  await request(baseUrl, "/api/external-work/providers/authoritative/sync", { method: "POST" });
+  const converged = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}/comments`);
+  assert.equal(converged.body.comments.length, 1);
+  assert.equal(converged.body.comments[0].id, commentId);
+  assert.equal(converged.body.comments[0].body, "Remote comment second revision");
+
+  await request(baseUrl, "/api/external-work/providers/authoritative/sync", { method: "POST" });
+  const settled = await request(baseUrl, `/api/tasks/${encodeURIComponent(task.id)}/comments`);
+  assert.equal(settled.body.comments.length, 1);
+  assert.equal(settled.body.comments[0].version, converged.body.comments[0].version);
+});

@@ -183,10 +183,15 @@ function persistSnapshot(database, provider, snapshot) {
       );
     }
     const id = externalCommentId(provider.id, externalOrigin, externalId, remoteId);
-    if (database.getComment(id)) continue;
+    const body = requireString(comment?.body, "comment.body", 100_000);
+    const existing = database.getComment(id);
+    if (existing) {
+      if (existing.body !== body) database.updateComment(id, existing.version, body);
+      continue;
+    }
     database.createComment(task.id, {
       id,
-      body: requireString(comment?.body, "comment.body", 100_000),
+      body,
       actor: normalizeActor(comment?.actor, provider.id),
       createdAt: requireString(comment?.createdAt, "comment.createdAt", 64),
     });

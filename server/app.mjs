@@ -3366,7 +3366,10 @@ export function createTaskboardServer(options = {}) {
                 )
                 : { authoritative: false, changed: false };
               if (providerResult.authoritative) {
-                const task = Object.keys(localChanges).length > 0
+                const hasLocalUpdate = Object.keys(localChanges).length > 0
+                  || threadId !== undefined
+                  || threadBinding !== undefined;
+                const task = hasLocalUpdate
                   ? database.updateTask(
                     id,
                     providerResult.task.version,
@@ -3493,7 +3496,17 @@ export function createTaskboardServer(options = {}) {
                   { status: move.status },
                 );
                 if (providerResult.authoritative) {
-                  const task = providerResult.task;
+                  const refreshed = providerResult.task;
+                  const task = move.threadId !== undefined || move.threadBinding !== undefined
+                    ? database.updateTask(
+                      id,
+                      refreshed.version,
+                      {},
+                      move.threadId,
+                      move.threadBinding,
+                      actorFromRequest(request),
+                    )
+                    : refreshed;
                   events.emit("task.moved", { task });
                   return sendJson(response, 200, { task });
                 }
