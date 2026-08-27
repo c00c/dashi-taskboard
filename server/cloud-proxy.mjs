@@ -23,7 +23,47 @@ export class CloudProxyError extends Error {
 export function isLocalCompanionRoute(pathname) {
   return LOCAL_COMPANION_ROUTES.has(pathname)
     || pathname.startsWith("/api/local/")
+    || pathname === "/api/external-work"
+    || pathname.startsWith("/api/external-work/")
     || /^\/api\/projects\/[^/]+\/development-contexts$/.test(pathname);
+}
+
+function decodeIdentity(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+export function isLocalCompanionRequest(pathname, method, {
+  getTask,
+  getComment,
+} = {}) {
+  if (isLocalCompanionRoute(pathname)) return true;
+
+  const taskRoute = pathname.match(
+    /^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move|comments))?$/,
+  );
+  if (taskRoute) {
+    const action = taskRoute[2] ?? null;
+    const isMutation = (
+      (!action && (method === "PATCH" || method === "DELETE"))
+      || (action === "comments" && method === "POST")
+      || (action !== "comments" && action !== null && method === "POST")
+    );
+    if (!isMutation) return false;
+    const taskId = decodeIdentity(taskRoute[1]);
+    const task = taskId === null ? null : getTask?.(taskId);
+    return task?.source !== undefined && task.source !== "local";
+  }
+
+  const commentRoute = pathname.match(/^\/api\/comments\/([^/]+)$/);
+  if (!commentRoute || (method !== "PATCH" && method !== "DELETE")) return false;
+  const commentId = decodeIdentity(commentRoute[1]);
+  const comment = commentId === null ? null : getComment?.(commentId);
+  const task = comment ? getTask?.(comment.taskId) : null;
+  return task?.source !== undefined && task.source !== "local";
 }
 
 function basicAuthorization(actorName, sharedKey) {

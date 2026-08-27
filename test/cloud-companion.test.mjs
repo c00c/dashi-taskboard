@@ -80,6 +80,67 @@ function memoryConfigStore(overrides = {}) {
   };
 }
 
+function controlledExternalProvider() {
+  const state = {
+    configurations: [],
+    mutations: [],
+    comments: [],
+  };
+  return {
+    state,
+    provider: {
+      id: "controlled",
+      displayName: "Controlled provider",
+      supportedMutations: ["title", "status"],
+      supportsComments: true,
+      async getConnection() {
+        return { configured: state.configurations.length > 0 };
+      },
+      async configure(configuration) {
+        state.configurations.push(configuration);
+      },
+      async discoverProjects() {
+        return [{
+          id: "controlled-project",
+          name: "Controlled project",
+          externalOrigin: "tenant-1",
+          externalId: "project-1",
+          externalUrl: "https://work.example.test/projects/1",
+        }];
+      },
+      async synchronize() {
+        return {
+          projects: await this.discoverProjects(),
+          tasks: [{
+            projectId: "controlled-project",
+            title: "External task",
+            remoteStatus: "todo",
+            externalOrigin: "tenant-1",
+            externalId: "task-1",
+            externalKey: "CTRL-1",
+            externalUrl: "https://work.example.test/tasks/1",
+          }],
+        };
+      },
+      mapStatus(status) {
+        return status;
+      },
+      async mutateTask(input) {
+        state.mutations.push(input);
+      },
+      async addComment(input) {
+        state.comments.push(input);
+        return {
+          id: `comment-${state.comments.length}`,
+          body: input.body,
+          actor: { id: "remote-user", name: "Remote user" },
+          createdAt: "2026-08-26T00:00:00.000Z",
+        };
+      },
+    },
+  };
+}
+
 function firstLanAddress() {
   return Object.values(os.networkInterfaces())
     .flat()
@@ -462,6 +523,8 @@ test("cloud routing keeps machine-specific capability endpoints in the local com
     "/api/projects/portfolio/development-contexts",
     "/api/local/cloud-session",
     "/api/local/project-mappings/portfolio",
+    "/api/external-work/providers",
+    "/api/external-work/providers/ado/connection",
   ]) {
     assert.equal(isLocalCompanionRoute(pathname), true, pathname);
   }
@@ -475,6 +538,143 @@ test("cloud routing keeps machine-specific capability endpoints in the local com
     "/api/events",
   ]) {
     assert.equal(isLocalCompanionRoute(pathname), false, pathname);
+  }
+});
+
+test("cloud companion keeps external provider credentials on the device", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-provider-config-"));
+  temporaryDirectories.push(directory);
+  const controlled = controlledExternalProvider();
+  const cloudRequests = [];
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    cloudConfigStore: memoryConfigStore(),
+    externalWorkProviders: [controlled.provider],
+    remoteFetch: async (url, init) => {
+      cloudRequests.push({ url: url.toString(), body: init.body });
+      return jsonResponse({ forwarded: true });
+    },
+  });
+  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+
+  try {
+    const secretConfiguration = {
+      organization: "https://dev.azure.com/example",
+      pat: "device-only-secret",
+    };
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/api/external-work/providers/controlled/connection`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(secretConfiguration),
+      },
+    );
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(controlled.state.configurations, [secretConfiguration]);
+    assert.deepEqual(cloudRequests, []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("cloud companion routes external task mutations locally without changing ordinary cloud forwarding", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-cloud-external-mutations-"));
+  temporaryDirectories.push(directory);
+  const controlled = controlledExternalProvider();
+  const cloudConfigStore = memoryConfigStore({ remoteUrl: null });
+  const cloudRequests = [];
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    cloudConfigStore,
+    externalWorkProviders: [controlled.provider],
+    remoteFetch: async (url, init) => {
+      cloudRequests.push({
+        url: url.toString(),
+        method: init.method,
+        body: typeof init.body === "string" ? JSON.parse(init.body) : null,
+      });
+      return jsonResponse({ task: { id: "CLOUD-1", title: "Cloud task" } });
+    },
+  });
+  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const syncResponse = await fetch(
+      `${baseUrl}/api/external-work/providers/controlled/sync`,
+      { method: "POST" },
+    );
+    const synchronized = await syncResponse.json();
+    const externalTask = synchronized.tasks[0];
+    const localCreateResponse = await fetch(`${baseUrl}/api/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "Local task" }),
+    });
+    const localTask = (await localCreateResponse.json()).task;
+    cloudConfigStore.state.remoteUrl = "https://tasks.example.test";
+
+    const patchBody = { version: externalTask.version, title: "Updated locally" };
+    const patchResponse = await fetch(
+      `${baseUrl}/api/tasks/${encodeURIComponent(externalTask.id)}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(patchBody),
+      },
+    );
+    assert.equal(patchResponse.status, 200);
+    const patchedTask = (await patchResponse.json()).task;
+
+    const moveBody = { version: patchedTask.version, status: "in_progress" };
+    const moveResponse = await fetch(
+      `${baseUrl}/api/tasks/${encodeURIComponent(externalTask.id)}/move`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(moveBody),
+      },
+    );
+    assert.equal(moveResponse.status, 200);
+
+    const commentBody = { body: "Provider-only comment" };
+    const commentResponse = await fetch(
+      `${baseUrl}/api/tasks/${encodeURIComponent(externalTask.id)}/comments`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(commentBody),
+      },
+    );
+    assert.equal(commentResponse.status, 201);
+
+    const ordinaryCloudBody = { version: localTask.version, title: "Forward unchanged" };
+    const cloudResponse = await fetch(
+      `${baseUrl}/api/tasks/${encodeURIComponent(localTask.id)}`,
+      {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(ordinaryCloudBody),
+      },
+    );
+    assert.equal(cloudResponse.status, 200);
+
+    assert.deepEqual(controlled.state.mutations.map(({ changes }) => changes), [
+      { title: "Updated locally" },
+      { status: "in_progress" },
+    ]);
+    assert.deepEqual(controlled.state.comments.map(({ body }) => body), [
+      "Provider-only comment",
+    ]);
+    assert.deepEqual(cloudRequests, [{
+      url: `https://tasks.example.test/api/tasks/${encodeURIComponent(localTask.id)}`,
+      method: "PATCH",
+      body: ordinaryCloudBody,
+    }]);
+  } finally {
+    await app.close();
   }
 });
 

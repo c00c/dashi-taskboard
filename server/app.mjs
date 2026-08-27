@@ -26,7 +26,7 @@ import { createCloudConfigStore } from "./cloud-config.mjs";
 import {
   CloudProxyError,
   createCloudProxy,
-  isLocalCompanionRoute,
+  isLocalCompanionRequest,
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
 import { createExternalWorkProviderRegistry } from "./external-work-providers.mjs";
@@ -2548,7 +2548,10 @@ export function createTaskboardServer(options = {}) {
         currentCloudConfig = await cloudConfig.read();
         if (currentCloudConfig.remoteUrl) {
           assertLoopbackRequest(request);
-          if (!isLocalCompanionRoute(pathname)) {
+          if (!isLocalCompanionRequest(pathname, request.method, {
+            getTask: (id) => database.getTask(id),
+            getComment: (id) => database.getComment(id),
+          })) {
             return sendFetchResponse(
               response,
               await cloudProxy.forward(toFetchRequest(request)),
