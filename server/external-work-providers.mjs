@@ -130,6 +130,13 @@ function normalizeTask(provider, task, index, projects) {
   };
 }
 
+function externalCommentId(providerId, externalOrigin, externalId, remoteId) {
+  return `external:${providerId}:comment:${createHash("sha256")
+    .update(`${externalOrigin}\0${externalId}\0${remoteId}`)
+    .digest("hex")
+    .slice(0, 32)}:comment:${remoteId}`.slice(0, 128);
+}
+
 function persistSnapshot(database, provider, snapshot) {
   const projects = (snapshot?.projects ?? []).map((project) => normalizeProject(provider.id, project));
   for (const project of projects) {
@@ -154,6 +161,27 @@ function persistSnapshot(database, provider, snapshot) {
     normalizeTask(provider, task, index, projectIds)
   ));
   database.syncExternalWork(provider.id, { projects, tasks });
+  for (const comment of snapshot?.comments ?? []) {
+    const externalOrigin = requireString(comment?.externalOrigin, "comment.externalOrigin", 512);
+    const externalId = requireString(comment?.externalId, "comment.externalId", 512);
+    const remoteId = requireString(comment?.id, "comment.id", 256);
+    const task = database.getTaskByExternalIdentity(provider.id, externalOrigin, externalId);
+    if (!task) {
+      throw new ExternalWorkProviderError(
+        502,
+        "EXTERNAL_COMMENT_TASK_NOT_FOUND",
+        "The external provider returned a comment for an unknown task",
+      );
+    }
+    const id = externalCommentId(provider.id, externalOrigin, externalId, remoteId);
+    if (database.getComment(id)) continue;
+    database.createComment(task.id, {
+      id,
+      body: requireString(comment?.body, "comment.body", 100_000),
+      actor: normalizeActor(comment?.actor, provider.id),
+      createdAt: requireString(comment?.createdAt, "comment.createdAt", 64),
+    });
+  }
   return {
     projects: projects.map((project) => database.getProject(project.id)),
     tasks: tasks.map((task) => database.getTaskByExternalIdentity(
@@ -376,10 +404,7 @@ export function createExternalWorkProviderRegistry({ providers = [], database })
       });
       const remoteId = requireString(comment?.id, "comment.id", 256);
       return {
-        id: `external:${providerId}:comment:${createHash("sha256")
-          .update(`${task.externalOrigin}\0${task.externalId}\0${remoteId}`)
-          .digest("hex")
-          .slice(0, 32)}:comment:${remoteId}`.slice(0, 128),
+        id: externalCommentId(providerId, task.externalOrigin, task.externalId, remoteId),
         body: requireString(comment?.body, "comment.body", 100_000),
         actor: normalizeActor(comment?.actor, providerId),
         createdAt: requireString(comment?.createdAt, "comment.createdAt", 64),

@@ -197,13 +197,21 @@ function createAdoFixture() {
   };
 }
 
-async function startServer(adoFetch) {
+function firstLanAddress() {
+  return Object.values(os.networkInterfaces())
+    .flat()
+    .find((entry) => entry?.family === "IPv4" && !entry.internal)?.address ?? null;
+}
+
+async function startServer(adoFetch, listen = { port: 0, host: "127.0.0.1" }) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "ado-provider-test-"));
   const app = createTaskboardServer({ dataDirectory: directory, adoFetch });
-  const address = await app.listen({ port: 0, host: "127.0.0.1" });
+  const address = await app.listen(listen);
   runningApps.push({ app, directory });
   return {
+    app,
     baseUrl: `http://127.0.0.1:${address.port}`,
+    port: address.port,
     configPath: path.join(directory, "external-work", "ado.json"),
   };
 }
@@ -323,15 +331,19 @@ test("ADO discovery and synchronization are observable through the public provid
     assert.equal(actors.response.status, 200);
     assert.deepEqual(actors.body.actors, [{
       type: "user",
-      id: "ado:33333333-3333-3333-3333-333333333333",
+      id: "ado:descriptor:aad.next-user",
       name: "Next ADO User",
       avatarUrl: null,
     }, {
       type: "user",
-      id: "ado:44444444-4444-4444-4444-444444444444",
+      id: "ado:descriptor:aad.another-user",
       name: "Another ADO User",
       avatarUrl: null,
     }]);
+    assert.equal(
+      ado.state.requests.filter((entry) => entry.pathname.includes("/_apis/graph/storagekeys/")).length,
+      0,
+    );
     ado.state.graphFailure = true;
     const failedActors = await request(baseUrl, "/api/external-work/providers/ado/actors");
     assert.equal(failedActors.response.status, 502);
@@ -412,7 +424,7 @@ test("ADO discovery and synchronization are observable through the public provid
         labels: unassigned.body.task.labels,
         assignee: {
           type: "user",
-          id: "ado:33333333-3333-3333-3333-333333333333",
+          id: "ado:descriptor:aad.next-user",
           name: "Next ADO User",
           avatarUrl: null,
         },
@@ -490,9 +502,15 @@ test("ADO discovery and synchronization are observable through the public provid
     const commentCalls = ado.state.requests.filter(
       (entry) => entry.pathname.endsWith("/comments"),
     );
-    assert.deepEqual(commentCalls.map((entry) => entry.method), ["POST", "GET", "GET"]);
-    assert.equal(commentCalls[2].continuationToken, "next-page");
-    assert.deepEqual(commentCalls[0].body, { text: "Remote-authoritative comment" });
+    assert.equal(commentCalls.some((entry) => entry.method === "POST"), true);
+    assert.equal(
+      commentCalls.some((entry) => entry.continuationToken === "next-page"),
+      true,
+    );
+    assert.deepEqual(
+      commentCalls.find((entry) => entry.method === "POST").body,
+      { text: "Remote-authoritative comment" },
+    );
 
     const event = await eventPromise;
     assert.equal(event.providerId, "ado");
@@ -540,7 +558,7 @@ test("ADO discovery and synchronization are observable through the public provid
     const storageKeyRequests = ado.state.requests.filter(
       (entry) => entry.pathname.includes("/_apis/graph/storagekeys/"),
     );
-    assert.deepEqual(storageKeyRequests.map((entry) => entry.apiVersion), ["7.1", "7.1"]);
+    assert.deepEqual(storageKeyRequests.map((entry) => entry.apiVersion), ["7.1"]);
     const batch = ado.state.requests.find(
       (entry) => entry.pathname.endsWith("/_apis/wit/workitemsbatch"),
     );
@@ -549,6 +567,94 @@ test("ADO discovery and synchronization are observable through the public provid
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("provider administration and credential-backed operations are device-local", async (t) => {
+  const lanAddress = firstLanAddress();
+  if (!lanAddress) {
+    t.skip("No non-loopback IPv4 interface is available");
+    return;
+  }
+  const ado = createAdoFixture();
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ado-local-boundary-"));
+  const { baseUrl, port } = await startServer(ado.fetch, { port: 0, host: "0.0.0.0" });
+  const task = await configureAndSync(baseUrl, { projects: configuration(directory).projects });
+  const lanBaseUrl = `http://${lanAddress}:${port}`;
+  const requestsBeforeLan = ado.state.requests.length;
+  const cases = [
+    ["GET", "/api/external-work/providers"],
+    ["PUT", "/api/external-work/providers/ado/connection", { organization: "attacker" }],
+    ["GET", "/api/external-work/providers/ado/projects"],
+    ["GET", "/api/external-work/providers/ado/actors"],
+    ["POST", "/api/external-work/providers/ado/sync"],
+    ["PATCH", `/api/tasks/${encodeURIComponent(task.id)}`, {
+      version: task.version,
+      status: "in_review",
+    }],
+    ["POST", `/api/tasks/${encodeURIComponent(task.id)}/move`, {
+      version: task.version,
+      status: "in_review",
+    }],
+    ["POST", `/api/tasks/${encodeURIComponent(task.id)}/comments`, {
+      body: "Must remain local",
+    }],
+  ];
+
+  try {
+    for (const [method, pathname, body] of cases) {
+      const result = await request(lanBaseUrl, pathname, {
+        method,
+        headers: { origin: lanBaseUrl },
+        ...(body === undefined ? {} : { body }),
+      });
+      assert.equal(result.response.status, 403, `${method} ${pathname}`);
+      assert.equal(result.body.error.code, "LOCAL_ONLY", `${method} ${pathname}`);
+    }
+    assert.equal(ado.state.requests.length, requestsBeforeLan);
+
+    const loopbackProviders = await request(baseUrl, "/api/external-work/providers");
+    assert.equal(loopbackProviders.response.status, 200);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ADO synchronization recovers an accepted comment after local persistence fails", async () => {
+  const ado = createAdoFixture();
+  const { app, baseUrl } = await startServer(ado.fetch);
+  const task = await configureAndSync(baseUrl);
+  const createComment = app.database.createComment.bind(app.database);
+  app.database.createComment = () => {
+    throw new Error("controlled local persistence failure");
+  };
+
+  const failed = await request(
+    baseUrl,
+    `/api/tasks/${encodeURIComponent(task.id)}/comments`,
+    { method: "POST", body: { body: "Accepted remotely once" } },
+  );
+  assert.equal(failed.response.status, 502);
+  assert.equal(failed.body.error.code, "EXTERNAL_COMMENT_PERSIST_FAILED");
+  assert.equal(ado.state.comments.length, 1);
+
+  app.database.createComment = createComment;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const synchronized = await request(
+      baseUrl,
+      "/api/external-work/providers/ado/sync",
+      { method: "POST" },
+    );
+    assert.equal(synchronized.response.status, 200);
+  }
+  const comments = await request(
+    baseUrl,
+    `/api/tasks/${encodeURIComponent(task.id)}/comments`,
+  );
+  assert.deepEqual(
+    comments.body.comments.map((comment) => comment.body),
+    ["Accepted remotely once"],
+  );
+  assert.equal(ado.state.comments.length, 1);
 });
 
 test("ADO rejects unmapped states without partially persisting a snapshot", async () => {

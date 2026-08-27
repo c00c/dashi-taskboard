@@ -2558,6 +2558,7 @@ export function createTaskboardServer(options = {}) {
       }
 
       if (pathname === "/api/external-work/providers") {
+        assertLoopbackRequest(request);
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
         assertNoQuery(url.searchParams, "GET /api/external-work/providers");
         return sendJson(response, 200, { providers: await externalWorkProviders.list() });
@@ -2567,6 +2568,7 @@ export function createTaskboardServer(options = {}) {
         /^\/api\/external-work\/providers\/([^/]+)\/(connection|projects|actors|sync)$/,
       );
       if (externalProviderRoute) {
+        assertLoopbackRequest(request);
         const providerId = decodeRouteSegment(externalProviderRoute[1], "providerId");
         const action = externalProviderRoute[2];
         assertNoQuery(url.searchParams, `${request.method} ${pathname}`);
@@ -2959,9 +2961,12 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Comment routes do not accept query parameters");
         }
         if (request.method === "POST") {
-          const input = resolveInputThreadBinding(parseCommentCreate(await readJson(request)));
           const current = database.getTask(taskId);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+          if (current.source !== "local" && externalWorkProviders.supportsComments(current.source)) {
+            assertLoopbackRequest(request);
+          }
+          const input = resolveInputThreadBinding(parseCommentCreate(await readJson(request)));
           const comment = current.source === "local"
             || !externalWorkProviders.supportsComments(current.source)
             ? database.createComment(taskId, {
@@ -3255,6 +3260,9 @@ export function createTaskboardServer(options = {}) {
         }
         if (!action && request.method === "PATCH") {
           const actor = actorFromRequest(request);
+          const current = database.getTask(id);
+          if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (current.source !== "local") assertLoopbackRequest(request);
           const {
             version,
             changes,
@@ -3262,8 +3270,6 @@ export function createTaskboardServer(options = {}) {
             threadBinding,
             assigneeTarget,
           } = resolveInputThreadBinding(parseTaskPatch(await readJson(request)));
-          const current = database.getTask(id);
-          if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
           if (assigneeTarget === "unassigned" && current.source === "local") {
             throw new ApiError(
               400,
@@ -3427,9 +3433,10 @@ export function createTaskboardServer(options = {}) {
           return sendEmpty(response, 204);
         }
         if (action === "move" && request.method === "POST") {
-          const move = resolveInputThreadBinding(parseMove(await readJson(request)));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (current.source !== "local") assertLoopbackRequest(request);
+          const move = resolveInputThreadBinding(parseMove(await readJson(request)));
           if (current.source !== "local") {
             return await runExternalProviderOperation(current.source, async () => {
               const latest = database.getTask(id);

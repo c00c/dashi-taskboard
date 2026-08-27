@@ -8,6 +8,7 @@ const API_VERSION = "7.1";
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_ATTEMPTS = 3;
 const WORK_ITEM_BATCH_SIZE = 200;
+const ADO_DESCRIPTOR_ACTOR_PREFIX = "ado:descriptor:";
 const WORK_ITEM_FIELDS = [
   "System.Id",
   "System.Title",
@@ -303,6 +304,29 @@ export function createAdoIntegration({
     return workItems;
   }
 
+  async function listWorkItemComments(config, projectId, workItemId) {
+    const comments = [];
+    let continuationToken = null;
+    do {
+      const query = new URLSearchParams({ $top: "200" });
+      if (continuationToken) query.set("continuationToken", continuationToken);
+      const page = await request(
+        config,
+        projectId,
+        `/_apis/wit/workitems/${workItemId}/comments?${query}`,
+        { returnResponseMetadata: true },
+      );
+      const values = Array.isArray(page.payload?.comments)
+        ? page.payload.comments
+        : responseValues(page.payload, "comment");
+      comments.push(...values);
+      continuationToken = page.headers.get("x-ms-continuationtoken")
+        ?? page.payload?.continuationToken
+        ?? null;
+    } while (continuationToken);
+    return comments;
+  }
+
   function mapStatus(remoteStatus) {
     const status = activeStateMapping[remoteStatus];
     if (!status) {
@@ -347,6 +371,7 @@ export function createAdoIntegration({
     );
     const projects = [];
     const tasks = [];
+    const comments = [];
     for (const configuredProject of config.projects) {
       for (const repositoryMapping of configuredProject.repositories) {
         const repository = repositoriesById.get(
@@ -398,10 +423,32 @@ export function createAdoIntegration({
             createdAt: fields["System.CreatedDate"],
             updatedAt: fields["System.ChangedDate"],
           });
+          const remoteComments = await listWorkItemComments(
+            config,
+            configuredProject.id,
+            externalId,
+          );
+          for (const comment of remoteComments) {
+            const commentId = String(comment?.commentId ?? comment?.id ?? "");
+            if (!commentId || comment?.isDeleted === true) continue;
+            comments.push({
+              externalOrigin: originFor(config),
+              externalId,
+              id: commentId,
+              body: String(comment.text ?? ""),
+              actor: actorFromIdentity(comment.createdBy, "ado-commenter"),
+              createdAt: String(
+                comment.createdDate
+                ?? comment.modifiedDate
+                ?? fields["System.ChangedDate"]
+                ?? new Date().toISOString(),
+              ),
+            });
+          }
         }
       }
     }
-    return { projects, tasks };
+    return { projects, tasks, comments };
   }
 
   async function mutationContext(identity) {
@@ -488,7 +535,7 @@ export function createAdoIntegration({
       const actors = [];
       let continuationToken = null;
       do {
-        const query = new URLSearchParams();
+        const query = new URLSearchParams({ $top: "1000" });
         if (continuationToken) query.set("continuationToken", continuationToken);
         const page = await request(
           config,
@@ -502,25 +549,14 @@ export function createAdoIntegration({
         );
         for (const user of responseValues(page.payload, "user")) {
           if (typeof user?.descriptor !== "string" || !user.descriptor || !user?.displayName) continue;
-          const storageKey = await request(
-            config,
-            null,
-            `/_apis/graph/storagekeys/${encodeURIComponent(user.descriptor)}`,
-            {
-              baseUrl: `https://vssps.dev.azure.com/${encodeURIComponent(config.organization)}/`,
-            },
-          );
-          if (!ADO_IDENTITY_ID_PATTERN.test(storageKey?.value ?? "")) {
-            throw new ExternalWorkProviderError(
-              502,
-              "INVALID_ADO_RESPONSE",
-              "Azure DevOps returned an invalid user storage key",
-            );
-          }
-          actors.push(actorFromIdentity({
-            id: storageKey.value,
-            displayName: user.displayName,
-          }, storageKey.value));
+          const actorId = `${ADO_DESCRIPTOR_ACTOR_PREFIX}${user.descriptor}`;
+          if (actorId.length > 240) continue;
+          actors.push({
+            type: "user",
+            id: actorId,
+            name: String(user.displayName).trim().slice(0, 120),
+            avatarUrl: null,
+          });
         }
         continuationToken = page.headers.get("x-ms-continuationtoken");
       } while (continuationToken);
@@ -560,7 +596,24 @@ export function createAdoIntegration({
           const actorId = typeof changes.assignee?.id === "string"
             ? changes.assignee.id
             : "";
-          const identityId = actorId.startsWith("ado:") ? actorId.slice(4) : actorId;
+          let identityId = actorId.startsWith("ado:") ? actorId.slice(4) : actorId;
+          if (
+            changes.assignee?.type === "user"
+            && actorId.startsWith(ADO_DESCRIPTOR_ACTOR_PREFIX)
+          ) {
+            const descriptor = actorId.slice(ADO_DESCRIPTOR_ACTOR_PREFIX.length);
+            const storageKey = descriptor
+              ? await request(
+                config,
+                null,
+                `/_apis/graph/storagekeys/${encodeURIComponent(descriptor)}`,
+                {
+                  baseUrl: `https://vssps.dev.azure.com/${encodeURIComponent(config.organization)}/`,
+                },
+              )
+              : null;
+            identityId = String(storageKey?.value ?? "");
+          }
           if (changes.assignee?.type !== "user" || !ADO_IDENTITY_ID_PATTERN.test(identityId)) {
             throw new ExternalWorkProviderError(
               409,
@@ -609,30 +662,12 @@ export function createAdoIntegration({
         },
       );
       let comment = null;
-      let continuationToken = null;
       try {
-        do {
-          const query = new URLSearchParams({ $top: "200" });
-          if (continuationToken) query.set("continuationToken", continuationToken);
-          const page = await request(
-            config,
-            project.id,
-            `/_apis/wit/workitems/${workItemId}/comments?${query}`,
-            { returnResponseMetadata: true },
-          );
-          const comments = Array.isArray(page.payload?.comments)
-            ? page.payload.comments
-            : responseValues(page.payload, "comment");
-          const createdId = String(created?.commentId ?? created?.id ?? "");
-          comment = comments.find((candidate) => (
+        const comments = await listWorkItemComments(config, project.id, workItemId);
+        const createdId = String(created?.commentId ?? created?.id ?? "");
+        comment = comments.find((candidate) => (
             String(candidate?.commentId ?? candidate?.id ?? "") === createdId
-          )) ?? null;
-          continuationToken = comment
-            ? null
-            : (page.headers.get("x-ms-continuationtoken")
-              ?? page.payload?.continuationToken
-              ?? null);
-        } while (continuationToken);
+        )) ?? null;
       } catch {
         throw new ExternalWorkProviderError(
           502,
